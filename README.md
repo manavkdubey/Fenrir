@@ -1,6 +1,7 @@
 # Fenrir
 
-[![Crates.io](https://img.shields.io/crates/v/fenrir)](https://crates.io/crates/fenrir) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Crates.io](https://img.shields.io/crates/v/fenrir)](https://crates.io/crates/fenrir) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 
 A fast-paced, Norse-inspired 2D space shooter built in Rust using the [Bevy game engine](https://bevyengine.org/) and [`bevy_state`](https://crates.io/crates/bevy_state) for state management. Pilot your ship through an asteroid field, blast incoming rocks, and prove yourself worthy of Valhalla!
 

@@ -36,7 +36,7 @@ A fast-paced, Norse-inspired 2D space shooter built in Rust using the [Bevy game
    git clone https://github.com/manavkdubey/Fenrir.git
    cd Fenrir
    cargo build --release
-````
+   ````
 
 3. **Run**
 

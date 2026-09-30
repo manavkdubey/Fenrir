@@ -1,16 +1,9 @@
-use std::io::BufWriter;
-use std::slice::Windows;
-
+use bevy::app::Startup;
 use bevy::asset::{LoadState, RenderAssetUsages};
 use bevy::prelude::*;
 use bevy::ui::ContentSize;
 use bevy::ui::widget::TextNodeFlags;
-use bevy::window::{PrimaryWindow, WindowResolution};
-use bevy::{app::Startup, utils::dbg};
-use bevy_asset_loader::loading_state::{LoadingState, LoadingStateAppExt};
-use bevy_state::prelude::*;
-use image::{ImageBuffer, Rgba};
-use rand::Rng;
+use rand::RngExt;
 use space_shooter::state::GameState;
 
 #[derive(Component, Default)]
@@ -23,12 +16,8 @@ struct PlayerBundle {
 }
 #[derive(Component, Default)]
 struct Asteroid {
-    vel: Vec3,
     pub angular_velocity: f32,
 }
-#[derive(Component)]
-pub struct PlayerController(pub Gamepad);
-
 #[derive(Component, Default)]
 pub struct Bullet {
     speed: f32,
@@ -47,11 +36,6 @@ struct Health {
 #[derive(Resource, Clone)]
 struct SpawnTimer(Timer);
 
-#[derive(Bundle, Default)]
-struct BulletBundle {
-    bullet: Bullet,
-    name: Name,
-}
 #[derive(Component)]
 pub struct GameEntity;
 
@@ -62,7 +46,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                resolution: (1280., 720.).into(),
+                resolution: (1280, 720).into(),
                 title: "Space shooter".into(),
                 resizable: true,
                 present_mode: bevy::window::PresentMode::Immediate,
@@ -72,7 +56,6 @@ fn main() {
         }))
         .insert_resource(SpawnTimer(Timer::from_seconds(1.0, TimerMode::Repeating)))
         .insert_resource(FireRate(Timer::from_seconds(0.15, TimerMode::Repeating)))
-        // .add_loading_state(LoadingState::new(GameState::Loading))
         .add_systems(Startup, (camera, rotate_bullet_on_startup))
         .insert_state::<GameState>(GameState::Playing)
         .add_systems(
@@ -122,28 +105,8 @@ fn setup_system(mut commands: Commands, asset_server: Res<AssetServer>) {
         .insert(Health { hp: 4 });
 }
 fn camera(mut commands: Commands) {
-    commands.spawn(Camera2d::default());
+    commands.spawn(Camera2d);
 }
-fn gamepad_system(gamepads: Query<(Entity, &Gamepad)>) {
-    for (entity, gamepad) in &gamepads {
-        if gamepad.just_pressed(GamepadButton::South) {
-            info!("{:?} just pressed South", entity);
-        } else if gamepad.just_released(GamepadButton::South) {
-            info!("{:?} just released South", entity);
-        }
-
-        let right_trigger = gamepad.get(GamepadButton::RightTrigger2).unwrap();
-        if right_trigger.abs() > 0.01 {
-            info!("{:?} RightTrigger2 value is {}", entity, right_trigger);
-        }
-
-        let left_stick_x = gamepad.get(GamepadAxis::LeftStickX).unwrap();
-        if left_stick_x.abs() > 0.01 {
-            info!("{:?} LeftStickX value is {}", entity, left_stick_x);
-        }
-    }
-}
-
 pub fn move_player(
     mut query: Query<&mut Transform, With<Player>>,
     gamepads: Query<(Entity, &Gamepad)>,
@@ -170,7 +133,11 @@ fn rotate_image_90_ccw(original: &Image) -> Image {
     let width = original.width() as usize;
     let height = original.height() as usize;
     let bytes_per_pixel = 4;
-    let mut new_data = vec![0; original.data.len()];
+    let original_data = original
+        .data
+        .as_ref()
+        .expect("loaded PNG has CPU image data");
+    let mut new_data = vec![0; original_data.len()];
 
     for y in 0..height {
         for x in 0..width {
@@ -180,7 +147,7 @@ fn rotate_image_90_ccw(original: &Image) -> Image {
             let dst_index = (dst_y * height + dst_x) * bytes_per_pixel;
 
             new_data[dst_index..dst_index + bytes_per_pixel]
-                .copy_from_slice(&original.data[src_index..src_index + bytes_per_pixel]);
+                .copy_from_slice(&original_data[src_index..src_index + bytes_per_pixel]);
         }
     }
 
@@ -247,7 +214,7 @@ pub fn aim(mut player: Query<&mut Transform, With<Player>>, gamepads: Query<&Gam
             let input_dir = Vec2::new(x, y);
             if input_dir.length_squared() > 0.01 {
                 let player_dir = player_transform.local_y().truncate();
-                let angle = player_dir.angle_between(input_dir);
+                let angle = player_dir.angle_to(input_dir);
                 player_transform.rotate_z(angle);
             }
         }
@@ -262,7 +229,6 @@ pub fn shoot(
     time: Res<Time>,
 ) {
     let Some(bullet_image) = bullet_image else {
-        dbg("No img");
         return;
     };
 
@@ -298,12 +264,16 @@ fn mouse_click_to_world(
     mouse: Res<ButtonInput<MouseButton>>,
 ) {
     if mouse.just_pressed(MouseButton::Left) {
-        let window = windows.single();
+        let Ok(window) = windows.single() else {
+            return;
+        };
         if let Some(cursor_pos) = window.cursor_position() {
-            let (camera, camera_transform) = camera_q.single();
+            let Ok((camera, camera_transform)) = camera_q.single() else {
+                return;
+            };
 
             // Convert screen position (UI coords) to world space
-            if let Some(world_pos) = camera.viewport_to_world(camera_transform, cursor_pos).ok() {
+            if let Ok(world_pos) = camera.viewport_to_world(camera_transform, cursor_pos) {
                 let world_translation = world_pos.origin.truncate(); // Vec2 (x, y)
                 dbg!(world_translation);
             }
@@ -326,14 +296,14 @@ fn spawn_asteriods(
     player: Query<&Transform, With<Player>>,
 ) {
     if spawn_timer.0.tick(time.delta()).just_finished() {
-        let Ok(player_transform) = player.get_single() else {
+        let Ok(player_transform) = player.single() else {
             return;
         };
 
         let mut rng = rand::rng();
         // Generate a position outside the exclusion zone
-        let x = rng.gen_range(-600.0..600.0);
-        let y = rng.gen_range(-350.0..350.0);
+        let x = rng.random_range(-600.0..600.0);
+        let y = rng.random_range(-350.0..350.0);
 
         // If it's inside the exclusion zone, mirror it out
         let spawn_x = if (x - player_transform.translation.x).abs() < 200.0 {
@@ -356,46 +326,30 @@ fn spawn_asteriods(
             y
         };
         let position = Vec3::new(spawn_x, spawn_y, 0.0);
-        let direction = (player_transform.translation - position).normalize();
-        dbg("Asteoid");
         commands
-            .spawn(SpriteBundle {
-                sprite: Sprite {
-                    image: asset_server.load("asteroid.png"),
-                    ..Default::default()
-                },
-                transform: Transform {
+            .spawn((
+                Sprite::from_image(asset_server.load("asteroid.png")),
+                Transform {
                     translation: position,
                     scale: Vec3::splat(0.07),
                     ..default()
                 },
-                ..Default::default()
-            })
+            ))
             .insert(Asteroid {
-                vel: direction * 100.0,
-                angular_velocity: rng.gen_range(-2.0..2.0),
+                angular_velocity: rng.random_range(-2.0..2.0),
             })
             .insert(GameEntity);
     }
 }
 fn move_asteroids(
-    mut query: ParamSet<(
-        Query<(&mut Transform, &Asteroid)>,
-        Query<&Transform, With<Player>>,
-    )>,
+    mut asteroids: Query<(&mut Transform, &Asteroid), Without<Player>>,
+    players: Query<&Transform, (With<Player>, Without<Asteroid>)>,
     time: Res<Time>,
 ) {
-    let player_translation = if let Ok(transform) = query.p1().get_single() {
-        transform.translation
-    } else {
-        return;
-    };
-
-    let mut binding2 = query.p0();
-    for (mut transform, asteroid) in binding2.iter_mut() {
-        let direction = (player_translation - transform.translation).normalize();
-        let speed = 100.0;
-        transform.translation += direction * speed * time.delta_secs();
+    let Ok(player) = players.single() else { return };
+    for (mut transform, asteroid) in &mut asteroids {
+        let direction = (player.translation - transform.translation).normalize();
+        transform.translation += direction * 100.0 * time.delta_secs();
         transform.rotate_z(asteroid.angular_velocity * time.delta_secs());
     }
 }
@@ -403,12 +357,11 @@ fn despawn_asteroid(
     asteroids: Query<(Entity, &Transform), With<Asteroid>>,
     players: Query<(Entity, &Transform), With<Player>>,
     mut health: Query<&mut Health>,
-    asset_server: Res<AssetServer>,
     mut commands: Commands,
     mut next_state: ResMut<NextState<GameState>>,
 ) {
     for asteroid in asteroids.iter() {
-        let Ok(player_transform) = players.get_single() else {
+        let Ok(player_transform) = players.single() else {
             return;
         };
 
@@ -440,7 +393,7 @@ fn show_game_over(mut commands: Commands, asset_server: Res<AssetServer>) {
             Text::new("GAME OVER\nPress O on your Controller to Restart"),
             TextFont {
                 font: font_handle.into(),
-                font_size: 48.0,
+                font_size: 48.0.into(),
                 ..default()
             },
             TextColor(Color::WHITE),
@@ -453,7 +406,7 @@ fn show_game_over(mut commands: Commands, asset_server: Res<AssetServer>) {
 }
 
 fn restart_on_o(gamepads: Query<&Gamepad>, mut next_state: ResMut<NextState<GameState>>) {
-    let Ok(gamepad) = gamepads.get_single() else {
+    let Ok(gamepad) = gamepads.single() else {
         return;
     };
     if gamepad.just_pressed(GamepadButton::East) {
@@ -464,11 +417,11 @@ fn restart_on_o(gamepads: Query<&Gamepad>, mut next_state: ResMut<NextState<Game
 fn cleanup_game(
     mut commands: Commands,
     entities: Query<Entity, With<GameEntity>>,
-    mut spawn_timer: Option<ResMut<SpawnTimer>>,
-    mut fire_rate: Option<ResMut<FireRate>>,
+    spawn_timer: Option<ResMut<SpawnTimer>>,
+    fire_rate: Option<ResMut<FireRate>>,
 ) {
     for entity in entities.iter() {
-        commands.entity(entity).despawn_recursive();
+        commands.entity(entity).despawn();
     }
 
     if let Some(mut timer) = spawn_timer {

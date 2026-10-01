@@ -2,6 +2,7 @@
 name = "space_shooter"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.97.1"
 
 [dependencies]
 bevy = { version = "0.20.1", default-features = false, features = ["2d", "ui", "keyboard", "mouse"] }

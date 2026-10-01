@@ -1,137 +1,78 @@
-# Fenrir
+# Fenrir: Ragnarök Engine
 
- [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+A Rust/Bevy 2D space shooter being developed into a destructible-asteroid action game.
+The current foundation includes movement, aiming, shooting, homing asteroids, health,
+score, pause, and clean restart. Localized destruction and the gravity weapon are planned;
+they are not implemented yet.
 
+## Run
 
-A fast-paced, Norse-inspired 2D space shooter built in Rust using the [Bevy game engine](https://bevyengine.org/) and [`bevy_state`](https://crates.io/crates/bevy_state) for state management. Pilot your ship through an asteroid field, blast incoming rocks, and prove yourself worthy of Valhalla!
+Use Rust 1.97.1 or newer and a GPU/driver supported by Bevy 0.20 / wgpu.
+On Linux, install development libraries for your window system and gamepad support
+(for example, Wayland/X11 and libudev). Cargo downloads the Rust dependencies.
 
----
-
-## 🚀 Features
-
-- **Norse Flavor**
-  Every cannon blast echoes the roar of Ragnarök under the watchful gaze of Fenrir.
-- **Procedural Asteroid Spawning**
-  Asteroids spawn around you and home in on your position with increasing speed.
-- **Gamepad-Only Controls**
-  Fully mapped to your controller—no keyboard/mouse required.
-- **Collision & Health**
-  Asteroids collide with your ship (4 HP), trigger a Game Over when depleted.
-- **Bullet Rotation**
-  Bullets are rotated on load (90° CCW) via a custom startup system.
-- **State Machine**
-  Loading → Menu (future) → Playing → GameOver → Cleanup, courtesy of `bevy_state`.
-- **Score Tracking & Restart**
-  Destroy asteroids for points, then press the East button (B) to restart on Game Over.
-
----
-
-## 📥 Installation
-
-1. **Prerequisites**
-   - Rust 1.70+
-   - GPU with OpenGL 3.2+ support
-2. **Clone & Build**
-   ```bash
-   git clone https://github.com/manavkdubey/Fenrir.git
-   cd Fenrir
-   cargo build --release
-   ````
-
-3. **Run**
-
-   ```bash
-   cargo run --release
-   ```
-
----
-
-## 📁 Project Structure
-
-```
-Fenrir/
-├── assets/               # Sprites, fonts, sounds
-├── src/
-│   ├── main.rs           # App setup, state & system registration
-│   ├── ship.rs           # Player bundle & components
-│   ├── asteroid.rs       # Asteroid component
-│   ├── systems/
-│   │   ├── camera.rs           # camera()
-│   │   ├── rotate_bullet.rs    # rotate_bullet_on_startup()
-│   │   ├── input.rs            # move_player(), aim(), shoot()
-│   │   ├── spawn.rs            # spawn_asteriods()
-│   │   ├── movement.rs         # move_bullet(), move_asteroids()
-│   │   ├── collision.rs        # bullet_hits_asteroid(), despawn_asteroid()
-│   │   ├── ui.rs               # show_game_over(), cleanup_game(), restart_on_o()
-│   │   └── debug.rs            # mouse_click_to_world(), gamepad_system()
-│   └── state.rs          # GameState enum & commands
-├── Cargo.toml
-└── README.md
+```sh
+cargo run --release --locked
 ```
 
----
+Run from the repository root so the `assets` directory is available.
+The game uses Bevy's 2D and UI feature sets; it does not enable the 3D or audio stacks.
+When launching a standalone binary, place `assets` next to it or set
+`BEVY_ASSET_ROOT` to the directory containing `assets`.
 
-## 🎮 Controls
+## Controls
 
-**Gamepad Only**
+| Action | Keyboard / mouse | Gamepad |
+| --- | --- | --- |
+| Move | WASD or arrow keys | Right stick |
+| Aim | Mouse cursor | Left stick |
+| Fire | Hold left click or Space | Hold right trigger |
+| Pause / resume | Escape | Start |
+| Restart after death | R or Enter | East face button |
 
-* **Move & Aim:** Left analog stick (X/Y)
-* **Shoot:** Right trigger (GamepadButton::RightTrigger2)
-* **Restart (Game Over):** East button (GamepadButton::East)
-* **Quit:** Close the window
+An active gamepad aiming stick takes precedence over mouse aim. One connected
+controller owns the ship; additional devices do not multiply movement or fire rate.
+Keyboard and controller movement combine with a maximum magnitude of one.
 
----
+## Simulation and checks
 
-## 🔧 Configuration
+Gameplay runs at 60 fixed ticks per second. Virtual-time catch-up is capped at
+100 ms per render frame, limiting work after a stall to at most six ticks. This trades
+wall-clock fidelity during a long stall for bounded simulation work.
 
-Tweak spawn rates and speeds in `src/systems/spawn.rs`:
+A run resets its random seed on restart. This makes spawn sequences repeatable for
+the same simulation/input history within this build; it does not promise identical
+results across rand versions, platforms, or arbitrary ECS insertion orders.
 
-```rust
-const ASTEROID_SPAWN_INTERVAL: f32 = 1.0;   // seconds between spawns
-const ASTEROID_SPEED: f32         = 100.0; // pixels/sec
+Bullets live for three seconds. There are hard caps of 128 bullets and 128 asteroids.
+Projectile collision uses a swept segment against circles and consumes each bullet
+on its nearest available hit. A target can score only once per collision pass.
+Collision is still a simple O(bullets × asteroids) pass; optimization needs measured
+scenarios before introducing a spatial index.
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo build --release --locked
 ```
 
-And fire rate in `main.rs`:
+Headless tests cover swept-hit edge cases, simultaneous hits, frame-rate-independent
+movement, projectile expiry, entity caps, pause/resume, finite asteroid motion, and
+50 death/restart cycles. Actual rendering and physical input require a desktop smoke
+test. No performance benchmark or FPS claim has been established.
 
-```rust
-.insert_resource(FireRate(Timer::from_seconds(0.15, TimerMode::Repeating)))
-```
+`src/main.rs` contains the current gameplay systems and their tests. `src/state.rs`
+defines the run states and is exported by `src/lib.rs`. The implementation will be
+split into focused modules when the destruction slice needs those boundaries.
 
----
+## Next milestones
 
-## 🛠️ Development
+The next milestones are localized asteroid destruction, a gravity weapon, bounded
+chain reactions, and reproducible performance scenarios. Those features remain
+subject to their design review. The project is not yet a finished portfolio release.
 
-* **Debug run:** `cargo run`
-* **Release build:** `cargo run --release`
-* **Format:** `cargo fmt`
-* **Lint:** `cargo clippy -- -D warnings`
+## License
 
----
-
-## 🗺️ Roadmap
-
-* 🎵 Add sound effects & music
-* 💥 Particle/explosion systems
-* 📊 High-score persistence
-* ➕ Power-ups (shields, rapid-fire)
-* 🎮 Full menu & pause screen
-
----
-
-## 🤝 Contributing
-
-1. Fork the repo
-2. Create a branch (`git checkout -b feature/YourFeature`)
-3. Commit your changes (`git commit -m "feat: …"`)
-4. Push & open a PR
-
----
-
-## 📄 License
-
-Released under the **MIT License**. See [LICENSE](LICENSE) for details.
-
----
-
-*“Let none escape his jaws.”*
-–– Inspired by Fenrir of Norse myth
+Code is available under the [MIT license](LICENSE). The repository contains existing
+art and font assets; a complete asset provenance audit remains part of release work.

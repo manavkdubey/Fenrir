@@ -1,12 +1,24 @@
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
-use bevy::{input::InputSystems, prelude::*, window::PrimaryWindow};
+use bevy::{
+    asset::RenderAssetUsages,
+    image::ImageSampler,
+    input::InputSystems,
+    prelude::*,
+    render::render_resource::{Extent3d, TextureDimension, TextureFormat},
+    window::PrimaryWindow,
+};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
-use space_shooter::state::GameState;
+use space_shooter::{
+    asteroid::{GRID_SIZE, MaterialGrid},
+    state::GameState,
+};
 
 const PLAYER_SPEED: f32 = 240.0;
 const BULLET_SPEED: f32 = 500.0;
-const HIT_RADIUS: f32 = 30.0;
+const ASTEROID_SCALE: f32 = 2.0;
+const CRATER_RADIUS: f32 = 4.0;
+const PLAYER_RADIUS: f32 = 14.0;
 const MAX_BULLETS: usize = 128;
 const MAX_ASTEROIDS: usize = 128;
 const RUN_SEED: u64 = 0xF3_2026;
@@ -17,6 +29,8 @@ struct Player;
 #[derive(Component)]
 struct Asteroid {
     angular_velocity: f32,
+    material: MaterialGrid,
+    image: Handle<Image>,
 }
 
 #[derive(Component)]
@@ -123,6 +137,7 @@ fn configure_gameplay(app: &mut App) {
         .init_resource::<Controls>()
         .init_resource::<Arena>()
         .init_resource::<Run>()
+        .init_resource::<Assets<Image>>()
         .init_resource::<GameAssets>()
         .insert_state(GameState::Playing)
         .add_systems(OnEnter(GameState::Playing), setup_run)
@@ -189,8 +204,15 @@ fn setup_run(
     ));
 }
 
-fn cleanup_run(mut commands: Commands, entities: Query<Entity, With<GameEntity>>) {
-    for entity in &entities {
+fn cleanup_run(
+    mut commands: Commands,
+    entities: Query<(Entity, Option<&Asteroid>), With<GameEntity>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    for (entity, asteroid) in &entities {
+        if let Some(asteroid) = asteroid {
+            images.remove(asteroid.image.id());
+        }
         commands.entity(entity).despawn();
     }
 }
@@ -348,11 +370,50 @@ fn move_bullets(mut bullets: Query<(&mut Transform, &mut Bullet)>, time: Res<Tim
     }
 }
 
+fn sample_asteroid(source: &Image) -> Option<(MaterialGrid, Image)> {
+    let mut pixels = Vec::with_capacity(GRID_SIZE * GRID_SIZE * 4);
+    let mut rows = [0; GRID_SIZE];
+    for (y, row) in rows.iter_mut().enumerate() {
+        for x in 0..GRID_SIZE {
+            let sx = ((x as f32 + 0.5) * source.width() as f32 / GRID_SIZE as f32) as u32;
+            let sy = ((y as f32 + 0.5) * source.height() as f32 / GRID_SIZE as f32) as u32;
+            let mut color = source.get_color_at(sx, sy).ok()?.to_srgba().to_u8_array();
+            if color[3] >= 128 {
+                *row |= 1 << x;
+            } else {
+                color[3] = 0;
+            }
+            pixels.extend_from_slice(&color);
+        }
+    }
+    let material = MaterialGrid::from_rows(rows);
+    if material.is_empty() {
+        return None;
+    }
+    Some((material, surface_image(pixels)))
+}
+
+fn surface_image(pixels: Vec<u8>) -> Image {
+    let mut image = Image::new(
+        Extent3d {
+            width: GRID_SIZE as u32,
+            height: GRID_SIZE as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        pixels,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.sampler = ImageSampler::nearest();
+    image
+}
+
 fn spawn_asteroids(
     mut commands: Commands,
     players: Query<&Transform, With<Player>>,
     asteroids: Query<Entity, With<Asteroid>>,
-    assets: Res<GameAssets>,
+    textures: (Res<GameAssets>, ResMut<Assets<Image>>),
     mut run: ResMut<Run>,
     time: Res<Time<Fixed>>,
 ) {
@@ -360,16 +421,70 @@ fn spawn_asteroids(
         return;
     }
     let Ok(player) = players.single() else { return };
+    let (assets, mut images) = textures;
+    let Some((material, image)) = images.get(&assets.asteroid).and_then(sample_asteroid) else {
+        return;
+    };
+    let image = images.add(image);
     let angle = run.rng.random_range(0.0..std::f32::consts::TAU);
     let position = player.translation.truncate() + Vec2::from_angle(angle) * 650.0;
     commands.spawn((
         Asteroid {
             angular_velocity: run.rng.random_range(-2.0..2.0),
+            material,
+            image: image.clone(),
         },
         GameEntity,
-        Sprite::from_image(assets.asteroid.clone()),
-        Transform::from_translation(position.extend(0.0)).with_scale(Vec3::splat(0.07)),
+        Sprite::from_image(image),
+        Transform::from_translation(position.extend(0.0)).with_scale(Vec3::splat(ASTEROID_SCALE)),
     ));
+}
+
+fn asteroid_local(transform: &Transform, point: Vec2) -> Vec2 {
+    (transform.rotation.inverse() * (point - transform.translation.truncate()).extend(0.0))
+        .truncate()
+        / transform.scale.truncate()
+}
+
+fn asteroid_hit(
+    transform: &Transform,
+    material: &MaterialGrid,
+    start: Vec2,
+    end: Vec2,
+) -> Option<f32> {
+    let radius = GRID_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2 * transform.scale.x;
+    segment_circle_hit(start, end, transform.translation.truncate(), radius)?;
+    material.ray_hit(
+        asteroid_local(transform, start),
+        asteroid_local(transform, end),
+    )
+}
+
+fn damage_surface(asteroid: &Asteroid, images: &mut Assets<Image>) {
+    let Some(mut image) = images.get_mut(&asteroid.image) else {
+        return;
+    };
+    let Some(pixels) = image.data.as_mut() else {
+        return;
+    };
+    for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        if !asteroid
+            .material
+            .occupied(index % GRID_SIZE, index / GRID_SIZE)
+        {
+            pixel[3] = 0;
+        }
+    }
+}
+
+fn despawn_asteroid(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    entity: Entity,
+    asteroid: &Asteroid,
+) {
+    images.remove(asteroid.image.id());
+    commands.entity(entity).despawn();
 }
 
 fn move_asteroids(
@@ -410,32 +525,35 @@ fn segment_circle_hit(start: Vec2, end: Vec2, center: Vec2, radius: f32) -> Opti
 fn bullet_collisions(
     mut commands: Commands,
     bullets: Query<(Entity, &Transform, &Bullet)>,
-    asteroids: Query<(Entity, &Transform), With<Asteroid>>,
+    mut asteroids: Query<(Entity, &Transform, &mut Asteroid)>,
+    mut images: ResMut<Assets<Image>>,
     mut run: ResMut<Run>,
 ) {
-    let mut destroyed = HashSet::new();
     for (bullet_entity, transform, bullet) in &bullets {
+        let start = bullet.previous;
+        let end = transform.translation.truncate();
         let hit = asteroids
             .iter()
-            .filter(|(entity, _)| !destroyed.contains(entity))
-            .filter_map(|(entity, asteroid)| {
-                segment_circle_hit(
-                    bullet.previous,
-                    transform.translation.truncate(),
-                    asteroid.translation.truncate(),
-                    HIT_RADIUS,
-                )
-                .map(|t| (entity, t))
+            .filter_map(|(entity, transform, asteroid)| {
+                asteroid_hit(transform, &asteroid.material, start, end).map(|t| (entity, t))
             })
             .min_by(|(ea, ta), (eb, tb)| {
                 ta.total_cmp(tb)
                     .then_with(|| ea.to_bits().cmp(&eb.to_bits()))
             });
-        if let Some((asteroid, _)) = hit {
-            destroyed.insert(asteroid);
-            commands.entity(asteroid).despawn();
+        if let Some((entity, t)) = hit {
+            let Ok((_, transform, mut asteroid)) = asteroids.get_mut(entity) else {
+                continue;
+            };
+            let impact = asteroid_local(transform, start.lerp(end, t));
+            asteroid.material.remove_circle(impact, CRATER_RADIUS);
             commands.entity(bullet_entity).despawn();
-            run.score += 1;
+            if asteroid.material.is_empty() {
+                despawn_asteroid(&mut commands, &mut images, entity, &asteroid);
+                run.score += 1;
+            } else {
+                damage_surface(&asteroid, &mut images);
+            }
         }
     }
 }
@@ -443,7 +561,8 @@ fn bullet_collisions(
 fn player_collisions(
     mut commands: Commands,
     mut players: Query<(&Transform, &mut Health), With<Player>>,
-    asteroids: Query<(Entity, &Transform), With<Asteroid>>,
+    asteroids: Query<(Entity, &Transform, &Asteroid)>,
+    mut images: ResMut<Assets<Image>>,
     mut next: ResMut<NextState<GameState>>,
 ) {
     let Ok((player, mut health)) = players.single_mut() else {
@@ -452,14 +571,13 @@ fn player_collisions(
     if health.0 == 0 {
         return;
     }
-    for (entity, asteroid) in &asteroids {
-        if player
-            .translation
-            .truncate()
-            .distance_squared(asteroid.translation.truncate())
-            <= HIT_RADIUS * HIT_RADIUS
+    for (entity, transform, asteroid) in &asteroids {
+        let center = asteroid_local(transform, player.translation.truncate());
+        if asteroid
+            .material
+            .overlaps_circle(center, PLAYER_RADIUS / transform.scale.x)
         {
-            commands.entity(entity).despawn();
+            despawn_asteroid(&mut commands, &mut images, entity, asteroid);
             health.0 = health.0.saturating_sub(1);
             if health.0 == 0 {
                 next.set(GameState::GameOver);
@@ -516,10 +634,13 @@ mod tests {
 
     fn game() -> App {
         let mut app = App::new();
+        let mut images = Assets::<Image>::default();
+        let source = images.add(surface_image(vec![255; GRID_SIZE * GRID_SIZE * 4]));
         app.add_plugins((MinimalPlugins, bevy::state::app::StatesPlugin))
+            .insert_resource(images)
             .insert_resource(GameAssets {
                 player: Handle::default(),
-                asteroid: Handle::default(),
+                asteroid: source,
                 bullet: Handle::default(),
             })
             .insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
@@ -536,12 +657,42 @@ mod tests {
     }
 
     fn asteroid(app: &mut App, position: Vec2) -> Entity {
+        asteroid_with_material(
+            app,
+            position,
+            MaterialGrid::from_rows([u32::MAX; GRID_SIZE]),
+        )
+    }
+
+    fn asteroid_with_material(app: &mut App, position: Vec2, material: MaterialGrid) -> Entity {
+        let pixels: Vec<u8> = (0..GRID_SIZE * GRID_SIZE)
+            .flat_map(|i| {
+                [
+                    200,
+                    200,
+                    200,
+                    if material.occupied(i % GRID_SIZE, i / GRID_SIZE) {
+                        255
+                    } else {
+                        0
+                    },
+                ]
+            })
+            .collect();
+        let image = app
+            .world_mut()
+            .resource_mut::<Assets<Image>>()
+            .add(surface_image(pixels));
         app.world_mut()
             .spawn((
                 Asteroid {
                     angular_velocity: 0.0,
+                    material,
+                    image: image.clone(),
                 },
-                Transform::from_translation(position.extend(0.0)),
+                Sprite::from_image(image),
+                Transform::from_translation(position.extend(0.0))
+                    .with_scale(Vec3::splat(ASTEROID_SCALE)),
                 GameEntity,
             ))
             .id()
@@ -559,6 +710,123 @@ mod tests {
                 GameEntity,
             ))
             .id()
+    }
+
+    #[test]
+    fn damage_pixels_match_collision_and_a_second_shot_crosses_the_hole() {
+        let mut app = game();
+        let rock = asteroid(&mut app, Vec2::ZERO);
+        bullet(&mut app, Vec2::ZERO, Vec2::ZERO);
+        app.world_mut().run_system_once(bullet_collisions).unwrap();
+        let asteroid = app.world().get::<Asteroid>(rock).unwrap();
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&asteroid.image)
+            .unwrap();
+        for (i, pixel) in image
+            .data
+            .as_ref()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                pixel[3] > 0,
+                asteroid.material.occupied(i % GRID_SIZE, i / GRID_SIZE)
+            );
+        }
+        let shot = bullet(&mut app, Vec2::ZERO, Vec2::ZERO);
+        app.world_mut().run_system_once(bullet_collisions).unwrap();
+        assert!(app.world().get_entity(shot).is_ok());
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn rotation_and_scale_map_world_hits_to_the_correct_cell() {
+        let mut rows = [0; GRID_SIZE];
+        rows[0] = 1;
+        let material = MaterialGrid::from_rows(rows);
+        let transform = Transform::from_xyz(70.0, -20.0, 0.0)
+            .with_rotation(Quat::from_rotation_z(std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::splat(ASTEROID_SCALE));
+        let world = |local: Vec2| transform.transform_point(local.extend(0.0)).truncate();
+        assert!(
+            asteroid_hit(
+                &transform,
+                &material,
+                world(Vec2::new(-20.0, 15.5)),
+                world(Vec2::new(-12.0, 15.5))
+            )
+            .is_some()
+        );
+        assert!(
+            asteroid_hit(
+                &transform,
+                &material,
+                world(Vec2::new(-20.0, -15.5)),
+                world(Vec2::new(-12.0, -15.5))
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn player_collision_respects_a_large_material_hole() {
+        let mut app = game();
+        let mut material = MaterialGrid::from_rows([u32::MAX; GRID_SIZE]);
+        material.remove_circle(Vec2::ZERO, 10.0);
+        let rock = asteroid_with_material(&mut app, Vec2::ZERO, material);
+        app.world_mut().run_system_once(player_collisions).unwrap();
+        assert!(app.world().get_entity(rock).is_ok());
+        let health = app
+            .world_mut()
+            .query::<&Health>()
+            .single(app.world())
+            .unwrap()
+            .0;
+        assert_eq!(health, 4);
+    }
+
+    #[test]
+    fn repository_texture_produces_matching_visible_material() {
+        let source = Image::from_buffer(
+            include_bytes!("../assets/asteroid.png"),
+            bevy::image::ImageType::Extension("png"),
+            bevy::image::CompressedImageFormats::NONE,
+            true,
+            ImageSampler::nearest(),
+            RenderAssetUsages::MAIN_WORLD,
+        )
+        .unwrap();
+        let (material, image) = sample_asteroid(&source).unwrap();
+        assert!(!material.is_empty());
+        assert!(!material.occupied(0, 0));
+        for (i, pixel) in image
+            .data
+            .as_ref()
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                pixel[3] > 0,
+                material.occupied(i % GRID_SIZE, i / GRID_SIZE)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_missing_image_data_do_not_spawn_material() {
+        let transparent = surface_image(vec![0; GRID_SIZE * GRID_SIZE * 4]);
+        assert!(sample_asteroid(&transparent).is_none());
+        let mut missing = transparent;
+        missing.data = None;
+        assert!(sample_asteroid(&missing).is_none());
     }
 
     #[test]
@@ -682,15 +950,30 @@ mod tests {
         let shot = bullet(&mut app, Vec2::ZERO, Vec2::new(200.0, 0.0));
         app.world_mut().run_system_once(bullet_collisions).unwrap();
         assert!(app.world().get_entity(farther).is_ok());
-        assert!(app.world().get_entity(nearer).is_err());
+        assert!(
+            !app.world()
+                .get::<Asteroid>(nearer)
+                .unwrap()
+                .material
+                .occupied(0, 16)
+        );
+        assert!(
+            app.world()
+                .get::<Asteroid>(farther)
+                .unwrap()
+                .material
+                .occupied(0, 16)
+        );
         assert!(app.world().get_entity(shot).is_err());
-        assert_eq!(app.world().resource::<Run>().score, 1);
+        assert_eq!(app.world().resource::<Run>().score, 0);
     }
 
     #[test]
     fn simultaneous_bullets_score_a_target_once() {
         let mut app = game();
-        asteroid(&mut app, Vec2::ZERO);
+        let mut rows = [0; GRID_SIZE];
+        rows[16] = 1 << 16;
+        asteroid_with_material(&mut app, Vec2::ZERO, MaterialGrid::from_rows(rows));
         bullet(&mut app, Vec2::ZERO, Vec2::ZERO);
         bullet(&mut app, Vec2::ZERO, Vec2::ZERO);
         app.world_mut().run_system_once(bullet_collisions).unwrap();
@@ -748,6 +1031,7 @@ mod tests {
                 GameState::GameOver
             );
             assert_eq!(count::<GameEntity>(&mut app), 0);
+            assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
             app.world_mut().resource_mut::<Controls>().firing = false;
             app.world_mut()
                 .resource_mut::<NextState<GameState>>()

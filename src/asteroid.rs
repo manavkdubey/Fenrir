@@ -21,6 +21,67 @@ impl MaterialGrid {
         self.rows.iter().all(|row| *row == 0)
     }
 
+    pub fn cell_count(&self) -> u32 {
+        self.rows.iter().map(|row| row.count_ones()).sum()
+    }
+
+    pub fn centroid(&self) -> Vec2 {
+        let mut sum = Vec2::ZERO;
+        let mut count = 0;
+        for y in 0..GRID_SIZE {
+            for x in 0..GRID_SIZE {
+                if self.occupied(x, y) {
+                    sum += cell_center(x, y);
+                    count += 1;
+                }
+            }
+        }
+        if count == 0 {
+            Vec2::ZERO
+        } else {
+            sum / count as f32
+        }
+    }
+
+    pub fn components(&self) -> Vec<Self> {
+        let mut remaining = self.clone();
+        let mut stack = [0; GRID_SIZE * GRID_SIZE];
+        let mut components = Vec::new();
+        for y in 0..GRID_SIZE {
+            for x in 0..GRID_SIZE {
+                if !remaining.occupied(x, y) {
+                    continue;
+                }
+                let mut component = Self::from_rows([0; GRID_SIZE]);
+                remaining.rows[y] &= !(1 << x);
+                stack[0] = y * GRID_SIZE + x;
+                let mut len = 1;
+                while len > 0 {
+                    len -= 1;
+                    let index = stack[len];
+                    let (cx, cy) = (index % GRID_SIZE, index / GRID_SIZE);
+                    component.rows[cy] |= 1 << cx;
+                    for (nx, ny) in [
+                        (cx.wrapping_sub(1), cy),
+                        (cx + 1, cy),
+                        (cx, cy.wrapping_sub(1)),
+                        (cx, cy + 1),
+                    ] {
+                        if remaining.occupied(nx, ny) {
+                            // Claim on push: each cell enters the bounded stack at most once.
+                            remaining.rows[ny] &= !(1 << nx);
+                            stack[len] = ny * GRID_SIZE + nx;
+                            len += 1;
+                        }
+                    }
+                }
+                components.push(component);
+            }
+        }
+        components.sort_by_key(|grid| std::cmp::Reverse(grid.cell_count()));
+        components
+    }
+
     pub fn remove_circle(&mut self, center: Vec2, radius: f32) -> u32 {
         if !center.is_finite() || !radius.is_finite() || radius < 0.0 {
             return 0;
@@ -107,6 +168,67 @@ fn segment_box_hit(start: Vec2, end: Vec2, min: Vec2, max: Vec2) -> Option<f32> 
 mod tests {
     use super::*;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn diagonal_cells_are_separate_and_largest_region_is_first() {
+        let mut rows = [0; GRID_SIZE];
+        rows[0] = 1;
+        rows[1] = 2;
+        rows[10] = 7 << 10;
+        let grid = MaterialGrid::from_rows(rows);
+        let parts = grid.components();
+        assert_eq!(
+            parts
+                .iter()
+                .map(MaterialGrid::cell_count)
+                .collect::<Vec<_>>(),
+            [3, 1, 1]
+        );
+        assert_eq!(parts[1].centroid(), Vec2::new(-15.5, 15.5));
+        assert_eq!(
+            MaterialGrid::from_rows([0; GRID_SIZE]).centroid(),
+            Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn checkerboard_exercises_maximum_four_neighbour_partition() {
+        let grid = MaterialGrid::from_rows(std::array::from_fn(|y| {
+            if y % 2 == 0 { 0x5555_5555 } else { 0xAAAA_AAAA }
+        }));
+        let parts = grid.components();
+        assert_eq!(parts.len(), GRID_SIZE * GRID_SIZE / 2);
+        assert!(parts.iter().all(|part| part.cell_count() == 1));
+        assert!(
+            MaterialGrid::from_rows([0; GRID_SIZE])
+                .components()
+                .is_empty()
+        );
+        let solid = MaterialGrid::from_rows([u32::MAX; GRID_SIZE]);
+        assert_eq!(solid.components(), [solid]);
+    }
+
+    #[test]
+    fn seeded_partitions_own_each_original_cell_exactly_once() {
+        let mut rng = StdRng::seed_from_u64(9001);
+        for _ in 0..100 {
+            let grid = MaterialGrid::from_rows(std::array::from_fn(|_| rng.random()));
+            let parts = grid.components();
+            assert_eq!(
+                parts.iter().map(MaterialGrid::cell_count).sum::<u32>(),
+                grid.cell_count()
+            );
+            for y in 0..GRID_SIZE {
+                for x in 0..GRID_SIZE {
+                    assert_eq!(
+                        parts.iter().filter(|part| part.occupied(x, y)).count(),
+                        usize::from(grid.occupied(x, y))
+                    );
+                }
+            }
+            assert_eq!(parts, grid.components());
+        }
+    }
 
     #[test]
     fn damage_is_local_repeatable_and_can_remove_every_cell() {

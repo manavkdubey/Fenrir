@@ -21,6 +21,11 @@ const CRATER_RADIUS: f32 = 4.0;
 const PLAYER_RADIUS: f32 = 14.0;
 const MAX_BULLETS: usize = 128;
 const MAX_ASTEROIDS: usize = 128;
+const MAX_FRAGMENTS: usize = 64;
+const MAX_NEW_FRAGMENTS: usize = 8;
+const MIN_FRAGMENT_CELLS: u32 = 4;
+const FRAGMENT_LIFETIME: f32 = 8.0;
+const MAX_FRAGMENT_SPEED: f32 = 400.0;
 const RUN_SEED: u64 = 0xF3_2026;
 
 #[derive(Component)]
@@ -31,6 +36,10 @@ struct Asteroid {
     angular_velocity: f32,
     material: MaterialGrid,
     image: Handle<Image>,
+    center: Vec2,
+    velocity: Vec2,
+    fragment_lifetime: Option<f32>,
+    fracture_pending: bool,
 }
 
 #[derive(Component)]
@@ -150,7 +159,9 @@ fn configure_gameplay(app: &mut App) {
                 move_bullets,
                 spawn_asteroids,
                 move_asteroids,
+                expire_fragments,
                 bullet_collisions,
+                split_asteroids,
                 player_collisions,
                 expire_bullets,
             )
@@ -431,6 +442,10 @@ fn spawn_asteroids(
     commands.spawn((
         Asteroid {
             angular_velocity: run.rng.random_range(-2.0..2.0),
+            center: material.centroid(),
+            velocity: Vec2::ZERO,
+            fragment_lifetime: None,
+            fracture_pending: false,
             material,
             image: image.clone(),
         },
@@ -460,20 +475,20 @@ fn asteroid_hit(
     )
 }
 
-fn damage_surface(asteroid: &Asteroid, images: &mut Assets<Image>) {
-    let Some(mut image) = images.get_mut(&asteroid.image) else {
-        return;
-    };
+fn mask_surface(material: &MaterialGrid, image: &mut Image) {
     let Some(pixels) = image.data.as_mut() else {
         return;
     };
     for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-        if !asteroid
-            .material
-            .occupied(index % GRID_SIZE, index / GRID_SIZE)
-        {
+        if !material.occupied(index % GRID_SIZE, index / GRID_SIZE) {
             pixel[3] = 0;
         }
+    }
+}
+
+fn damage_surface(asteroid: &Asteroid, images: &mut Assets<Image>) {
+    if let Some(mut image) = images.get_mut(&asteroid.image) {
+        mask_surface(&asteroid.material, &mut image);
     }
 }
 
@@ -489,16 +504,124 @@ fn despawn_asteroid(
 
 fn move_asteroids(
     players: Query<&Transform, (With<Player>, Without<Asteroid>)>,
-    mut asteroids: Query<(&mut Transform, &Asteroid), Without<Player>>,
+    mut asteroids: Query<(&mut Transform, &mut Asteroid), Without<Player>>,
     time: Res<Time<Fixed>>,
 ) {
-    let Ok(player) = players.single() else { return };
-    for (mut transform, asteroid) in &mut asteroids {
-        let direction = (player.translation - transform.translation)
-            .truncate()
-            .normalize_or_zero();
-        transform.translation += (direction * 100.0 * time.delta_secs()).extend(0.0);
+    let player = players
+        .single()
+        .ok()
+        .map(|transform| transform.translation.truncate());
+    for (mut transform, mut asteroid) in &mut asteroids {
+        let center = transform
+            .transform_point(asteroid.center.extend(0.0))
+            .truncate();
+        if let Some(lifetime) = asteroid.fragment_lifetime.as_mut() {
+            *lifetime -= time.delta_secs();
+        } else if let Some(player) = player {
+            asteroid.velocity = (player - center).normalize_or_zero() * 100.0;
+        }
+        let next_center = center + asteroid.velocity * time.delta_secs();
         transform.rotate_z(asteroid.angular_velocity * time.delta_secs());
+        let offset = (transform.rotation
+            * (asteroid.center * transform.scale.truncate()).extend(0.0))
+        .truncate();
+        transform.translation = (next_center - offset).extend(transform.translation.z);
+    }
+}
+
+fn expire_fragments(
+    mut commands: Commands,
+    asteroids: Query<(Entity, &Asteroid)>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    for (entity, asteroid) in &asteroids {
+        if asteroid
+            .fragment_lifetime
+            .is_some_and(|remaining| remaining <= 0.0)
+        {
+            despawn_asteroid(&mut commands, &mut images, entity, asteroid);
+        }
+    }
+}
+
+fn split_asteroids(
+    mut commands: Commands,
+    mut asteroids: Query<(&Transform, &mut Asteroid)>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let body_count = asteroids.iter().count();
+    let fragment_count = asteroids
+        .iter()
+        .filter(|(_, body)| body.fragment_lifetime.is_some())
+        .count();
+    let mut budget = MAX_FRAGMENTS
+        .saturating_sub(fragment_count)
+        .min(MAX_ASTEROIDS.saturating_sub(body_count));
+    for (transform, mut asteroid) in &mut asteroids {
+        if !asteroid.fracture_pending {
+            continue;
+        }
+        asteroid.fracture_pending = false;
+        let mut parts = asteroid.material.components().into_iter();
+        let Some(largest) = parts.next() else {
+            continue;
+        };
+        let previous_center = asteroid.center;
+        let velocity = asteroid.velocity;
+        let angular_velocity = asteroid.angular_velocity;
+        let inherited_velocity = |center: Vec2| {
+            let offset = (transform.rotation
+                * ((center - previous_center) * transform.scale.truncate()).extend(0.0))
+            .truncate();
+            velocity + offset.perp() * angular_velocity
+        };
+        asteroid.center = largest.centroid();
+        asteroid.velocity = inherited_velocity(asteroid.center);
+        if asteroid.fragment_lifetime.is_some() {
+            asteroid.velocity = asteroid.velocity.clamp_length_max(MAX_FRAGMENT_SPEED);
+        }
+        asteroid.material = largest;
+        if parts.len() == 0 {
+            continue;
+        }
+        let source = if budget > 0 {
+            images.get(&asteroid.image).cloned()
+        } else {
+            None
+        };
+        for material in parts.take(MAX_NEW_FRAGMENTS) {
+            if budget == 0 || material.cell_count() < MIN_FRAGMENT_CELLS {
+                break;
+            }
+            let Some(source) = source.as_ref() else { break };
+            let center = material.centroid();
+            let outward = (transform.rotation * (center - previous_center).extend(0.0))
+                .truncate()
+                .normalize_or_zero();
+            let velocity =
+                (inherited_velocity(center) + outward * 35.0).clamp_length_max(MAX_FRAGMENT_SPEED);
+            let mut image = source.clone();
+            mask_surface(&material, &mut image);
+            let image = images.add(image);
+            commands.spawn((
+                Asteroid {
+                    material,
+                    center,
+                    velocity,
+                    image: image.clone(),
+                    angular_velocity,
+                    fragment_lifetime: Some(
+                        asteroid.fragment_lifetime.unwrap_or(FRAGMENT_LIFETIME),
+                    ),
+                    fracture_pending: false,
+                },
+                GameEntity,
+                Sprite::from_image(image),
+                *transform,
+            ));
+            budget -= 1;
+        }
+        damage_surface(&asteroid, &mut images);
     }
 }
 
@@ -547,10 +670,13 @@ fn bullet_collisions(
             };
             let impact = asteroid_local(transform, start.lerp(end, t));
             asteroid.material.remove_circle(impact, CRATER_RADIUS);
+            asteroid.fracture_pending = true;
             commands.entity(bullet_entity).despawn();
             if asteroid.material.is_empty() {
                 despawn_asteroid(&mut commands, &mut images, entity, &asteroid);
-                run.score += 1;
+                if asteroid.fragment_lifetime.is_none() {
+                    run.score += 1;
+                }
             } else {
                 damage_surface(&asteroid, &mut images);
             }
@@ -646,6 +772,7 @@ mod tests {
             .insert_resource(TimeUpdateStrategy::FixedTimesteps(1));
         configure_gameplay(&mut app);
         app.update();
+        app.update();
         app
     }
 
@@ -687,6 +814,10 @@ mod tests {
             .spawn((
                 Asteroid {
                     angular_velocity: 0.0,
+                    center: material.centroid(),
+                    velocity: Vec2::ZERO,
+                    fragment_lifetime: None,
+                    fracture_pending: false,
                     material,
                     image: image.clone(),
                 },
@@ -710,6 +841,228 @@ mod tests {
                 GameEntity,
             ))
             .id()
+    }
+
+    fn barbell() -> MaterialGrid {
+        let mut rows = [0; GRID_SIZE];
+        for row in &mut rows[12..21] {
+            *row = (0xFF << 2) | (0xFF << 22);
+        }
+        rows[16] |= 0xFFF << 10;
+        MaterialGrid::from_rows(rows)
+    }
+
+    #[test]
+    fn projectile_cut_splits_without_duplicating_cells_pixels_or_pose() {
+        let mut app = game();
+        let rock = asteroid_with_material(&mut app, Vec2::ZERO, barbell());
+        let pose = *app.world().get::<Transform>(rock).unwrap();
+        bullet(&mut app, Vec2::ZERO, Vec2::ZERO);
+        app.world_mut().run_system_once(bullet_collisions).unwrap();
+        let damaged = app.world().get::<Asteroid>(rock).unwrap().material.clone();
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), 2);
+        let mut bodies = app.world_mut().query::<(&Asteroid, &Transform)>();
+        let mut cells = 0;
+        let mut fragments = 0;
+        for (body, transform) in bodies.iter(app.world()) {
+            cells += body.material.cell_count();
+            fragments += usize::from(body.fragment_lifetime.is_some());
+            assert_eq!(transform.translation, pose.translation);
+            assert_eq!(transform.rotation, pose.rotation);
+            assert_eq!(body.center, body.material.centroid());
+            assert!(body.velocity.is_finite() && body.velocity.length() <= MAX_FRAGMENT_SPEED);
+            let image = app
+                .world()
+                .resource::<Assets<Image>>()
+                .get(&body.image)
+                .unwrap();
+            for (i, pixel) in image
+                .data
+                .as_ref()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    pixel[3] > 0,
+                    body.material.occupied(i % GRID_SIZE, i / GRID_SIZE)
+                );
+            }
+        }
+        assert_eq!(cells, damaged.cell_count());
+        assert_eq!(fragments, 1);
+        for y in 0..GRID_SIZE {
+            for x in 0..GRID_SIZE {
+                assert_eq!(
+                    bodies
+                        .iter(app.world())
+                        .filter(|(body, _)| body.material.occupied(x, y))
+                        .count(),
+                    usize::from(damaged.occupied(x, y))
+                );
+            }
+        }
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 3);
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn fracture_budget_reserves_deferred_spawns_across_all_parents() {
+        let mut app = game();
+        let mut shape = barbell();
+        shape.remove_circle(Vec2::ZERO, CRATER_RADIUS);
+        for _ in 0..MAX_FRAGMENTS {
+            let rock = asteroid_with_material(&mut app, Vec2::splat(1000.0), shape.clone());
+            app.world_mut()
+                .get_mut::<Asteroid>(rock)
+                .unwrap()
+                .fracture_pending = true;
+        }
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), MAX_ASTEROIDS);
+        let fragments = app
+            .world_mut()
+            .query::<&Asteroid>()
+            .iter(app.world())
+            .filter(|body| body.fragment_lifetime.is_some())
+            .count();
+        assert_eq!(fragments, MAX_FRAGMENTS);
+        assert_eq!(
+            app.world().resource::<Assets<Image>>().len(),
+            MAX_ASTEROIDS + 1
+        );
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), MAX_ASTEROIDS);
+    }
+
+    #[test]
+    fn tiny_and_over_budget_regions_follow_the_debris_policy() {
+        let mut app = game();
+        let mut rows = [0; GRID_SIZE];
+        for y in (0..GRID_SIZE - 1).step_by(3) {
+            for x in (0..GRID_SIZE - 1).step_by(3) {
+                rows[y] |= 3 << x;
+                rows[y + 1] |= 3 << x;
+            }
+        }
+        let rock = asteroid_with_material(&mut app, Vec2::ZERO, MaterialGrid::from_rows(rows));
+        app.world_mut()
+            .get_mut::<Asteroid>(rock)
+            .unwrap()
+            .fracture_pending = true;
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), MAX_NEW_FRAGMENTS + 1);
+        let cells: u32 = app
+            .world_mut()
+            .query::<&Asteroid>()
+            .iter(app.world())
+            .map(|body| body.material.cell_count())
+            .sum();
+        assert_eq!(cells, (MAX_NEW_FRAGMENTS as u32 + 1) * 4);
+        app.world_mut().run_system_once(cleanup_run).unwrap();
+        let mut rows = [0; GRID_SIZE];
+        rows[0] = 3;
+        rows[1] = 3;
+        rows[31] = 1 << 31;
+        let rock = asteroid_with_material(&mut app, Vec2::ZERO, MaterialGrid::from_rows(rows));
+        app.world_mut()
+            .get_mut::<Asteroid>(rock)
+            .unwrap()
+            .fracture_pending = true;
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), 1);
+        assert_eq!(
+            app.world()
+                .get::<Asteroid>(rock)
+                .unwrap()
+                .material
+                .cell_count(),
+            4
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 2);
+    }
+
+    #[test]
+    fn refracturing_preserves_remaining_lifetime_and_expiry_releases_images() {
+        let mut app = game();
+        let mut material = barbell();
+        material.remove_circle(Vec2::ZERO, CRATER_RADIUS);
+        let rock = asteroid_with_material(&mut app, Vec2::splat(1000.0), material);
+        {
+            let mut body = app.world_mut().get_mut::<Asteroid>(rock).unwrap();
+            body.fracture_pending = true;
+            body.fragment_lifetime = Some(0.001);
+        }
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), 2);
+        for body in app.world_mut().query::<&Asteroid>().iter(app.world()) {
+            assert_eq!(body.fragment_lifetime, Some(0.001));
+        }
+        app.world_mut().run_system_once(move_asteroids).unwrap();
+        app.world_mut().run_system_once(expire_fragments).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), 0);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn expired_fragment_cannot_damage_the_player_in_its_last_tick() {
+        let mut app = game();
+        let rock = asteroid(&mut app, Vec2::ZERO);
+        app.world_mut()
+            .get_mut::<Asteroid>(rock)
+            .unwrap()
+            .fragment_lifetime = Some(0.001);
+        app.update();
+        assert!(app.world().get_entity(rock).is_err());
+        assert_eq!(
+            app.world_mut()
+                .query::<&Health>()
+                .single(app.world())
+                .unwrap()
+                .0,
+            4
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+    }
+
+    #[test]
+    fn fragment_rotates_about_its_material_center_and_cannot_farm_score() {
+        let mut app = game();
+        let mut rows = [0; GRID_SIZE];
+        rows[0] = 3;
+        rows[1] = 3;
+        let rock =
+            asteroid_with_material(&mut app, Vec2::splat(1000.0), MaterialGrid::from_rows(rows));
+        let center = app.world().get::<Asteroid>(rock).unwrap().center;
+        let before = app
+            .world()
+            .get::<Transform>(rock)
+            .unwrap()
+            .transform_point(center.extend(0.0));
+        {
+            let mut body = app.world_mut().get_mut::<Asteroid>(rock).unwrap();
+            body.fragment_lifetime = Some(1.0);
+            body.velocity = Vec2::new(100.0, 20.0);
+            body.angular_velocity = 2.0;
+        }
+        app.world_mut().run_system_once(move_asteroids).unwrap();
+        let after = app
+            .world()
+            .get::<Transform>(rock)
+            .unwrap()
+            .transform_point(center.extend(0.0));
+        let dt = app.world().resource::<Time<Fixed>>().delta_secs();
+        assert!(dt > 0.0);
+        assert!((after - before - Vec3::new(100.0, 20.0, 0.0) * dt).length() < 0.001);
+        bullet(&mut app, after.truncate(), after.truncate());
+        app.world_mut().run_system_once(bullet_collisions).unwrap();
+        assert!(app.world().get_entity(rock).is_err());
+        assert_eq!(app.world().resource::<Run>().score, 0);
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
     }
 
     #[test]
@@ -1021,8 +1374,14 @@ mod tests {
             }
             assert!(count::<Bullet>(&mut app) > 0);
             assert!(count::<Asteroid>(&mut app) > 0);
-            for _ in 0..8 {
-                asteroid(&mut app, Vec2::ZERO);
+            for i in 0..8 {
+                let rock = asteroid(&mut app, Vec2::ZERO);
+                if i % 2 == 0 {
+                    app.world_mut()
+                        .get_mut::<Asteroid>(rock)
+                        .unwrap()
+                        .fragment_lifetime = Some(FRAGMENT_LIFETIME);
+                }
             }
             app.world_mut().run_system_once(player_collisions).unwrap();
             app.update();
@@ -1056,6 +1415,12 @@ mod tests {
     #[test]
     fn pause_freezes_simulation_and_resume_keeps_player() {
         let mut app = game();
+        let fragment = asteroid(&mut app, Vec2::splat(1000.0));
+        app.world_mut()
+            .get_mut::<Asteroid>(fragment)
+            .unwrap()
+            .fragment_lifetime = Some(1.0);
+
         let player = app
             .world_mut()
             .query_filtered::<Entity, With<Player>>()
@@ -1074,6 +1439,13 @@ mod tests {
             0.0
         );
         assert_eq!(app.world().resource::<Run>().spawn.elapsed(), elapsed);
+        assert_eq!(
+            app.world()
+                .get::<Asteroid>(fragment)
+                .unwrap()
+                .fragment_lifetime,
+            Some(1.0)
+        );
         app.world_mut()
             .resource_mut::<NextState<GameState>>()
             .set(GameState::Playing);

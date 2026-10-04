@@ -11,6 +11,7 @@ use bevy::{
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use space_shooter::{
     asteroid::{GRID_SIZE, MaterialGrid},
+    gravity::{ACTIVE_DURATION, DEPLOY_RANGE, FIELD_RADIUS, GravityPhase, GravityWell},
     state::GameState,
 };
 
@@ -58,6 +59,15 @@ struct GameEntity;
 #[derive(Component)]
 struct Hud;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct HudSnapshot {
+    health: u32,
+    score: u32,
+    state: GameState,
+    gravity_label: &'static str,
+    gravity_seconds: u32,
+}
+
 #[derive(Resource)]
 struct GameAssets {
     player: Handle<Image>,
@@ -82,6 +92,7 @@ struct Controls {
     aim: Option<Vec2>,
     cursor: Option<Vec2>,
     firing: bool,
+    gravity_requested: bool,
 }
 
 #[derive(Resource)]
@@ -131,10 +142,19 @@ fn main() {
     }))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.04)))
     .add_systems(Startup, setup_view)
-    .add_systems(PreUpdate, sample_controls.after(InputSystems))
-    .add_systems(Update, (handle_state_input, update_hud));
+    .add_systems(Update, (update_hud, draw_gravity));
     configure_gameplay(&mut app);
+    configure_input(&mut app);
     app.run();
+}
+
+fn configure_input(app: &mut App) {
+    app.add_systems(
+        PreUpdate,
+        (sample_controls, handle_state_input)
+            .chain()
+            .after(InputSystems),
+    );
 }
 
 fn configure_gameplay(app: &mut App) {
@@ -144,6 +164,7 @@ fn configure_gameplay(app: &mut App) {
     app.insert_resource(virtual_time)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<Controls>()
+        .init_resource::<GravityWell>()
         .init_resource::<Arena>()
         .init_resource::<Run>()
         .init_resource::<Assets<Image>>()
@@ -155,6 +176,7 @@ fn configure_gameplay(app: &mut App) {
             FixedUpdate,
             (
                 move_player,
+                update_gravity,
                 shoot,
                 move_bullets,
                 spawn_asteroids,
@@ -199,12 +221,16 @@ fn setup_run(
     assets: Res<GameAssets>,
     players: Query<Entity, With<Player>>,
     mut run: ResMut<Run>,
+    mut gravity: ResMut<GravityWell>,
+    mut controls: ResMut<Controls>,
 ) {
     // Resuming from pause keeps the existing world and timers.
     if !players.is_empty() {
         return;
     }
     *run = Run::default();
+    *gravity = GravityWell::default();
+    controls.gravity_requested = false;
     commands.spawn((
         Player,
         Health(4),
@@ -219,7 +245,11 @@ fn cleanup_run(
     mut commands: Commands,
     entities: Query<(Entity, Option<&Asteroid>), With<GameEntity>>,
     mut images: ResMut<Assets<Image>>,
+    mut gravity: ResMut<GravityWell>,
+    mut controls: ResMut<Controls>,
 ) {
+    *gravity = GravityWell::default();
+    controls.gravity_requested = false;
     for (entity, asteroid) in &entities {
         if let Some(asteroid) = asteroid {
             images.remove(asteroid.image.id());
@@ -237,11 +267,20 @@ fn sample_controls(
     mut controls: ResMut<Controls>,
     mut arena: ResMut<Arena>,
 ) {
-    *controls = Controls::default();
-    let Ok(window) = windows.single() else { return };
+    let pending = controls.gravity_requested;
+    *controls = Controls {
+        gravity_requested: pending,
+        ..default()
+    };
+    let Ok(window) = windows.single() else {
+        controls.gravity_requested = false;
+        return;
+    };
     if !window.focused {
+        controls.gravity_requested = false;
         return;
     }
+    controls.gravity_requested |= keys.just_pressed(KeyCode::KeyQ);
     let axis = |positive: [KeyCode; 2], negative: [KeyCode; 2]| {
         f32::from(keys.any_pressed(positive)) - f32::from(keys.any_pressed(negative))
     };
@@ -267,6 +306,7 @@ fn sample_controls(
             controls.aim = Some(aim);
         }
         controls.firing |= gamepad.pressed(GamepadButton::RightTrigger2);
+        controls.gravity_requested |= gamepad.just_pressed(GamepadButton::LeftTrigger2);
     }
     controls.movement = controls.movement.clamp_length_max(1.0);
     if let Ok((camera, transform)) = cameras.single() {
@@ -290,6 +330,7 @@ fn handle_state_input(
     state: Res<State<GameState>>,
     mut next: ResMut<NextState<GameState>>,
     mut time: ResMut<Time<Virtual>>,
+    mut controls: ResMut<Controls>,
 ) {
     let gamepad = gamepads
         .iter()
@@ -300,6 +341,9 @@ fn handle_state_input(
     let restart = keys.just_pressed(KeyCode::KeyR)
         || keys.just_pressed(KeyCode::Enter)
         || gamepad.is_some_and(|pad| pad.just_pressed(GamepadButton::East));
+    if *state.get() != GameState::Playing || pause {
+        controls.gravity_requested = false;
+    }
     match state.get() {
         GameState::Playing if pause => {
             time.pause();
@@ -338,6 +382,45 @@ fn move_player(
         if let Some(direction) = aim.filter(|d| d.length_squared() > 0.01) {
             transform.rotation = Quat::from_rotation_z(Vec2::Y.angle_to(direction));
         }
+    }
+}
+
+fn update_gravity(
+    mut gravity: ResMut<GravityWell>,
+    mut controls: ResMut<Controls>,
+    players: Query<&Transform, With<Player>>,
+    time: Res<Time<Fixed>>,
+) {
+    gravity.tick(time.delta_secs());
+    if !std::mem::take(&mut controls.gravity_requested) {
+        return;
+    }
+    let Ok(player) = players.single() else { return };
+    let origin = player.translation.truncate();
+    let target = if let Some(direction) = controls.aim {
+        origin + direction.normalize_or_zero() * DEPLOY_RANGE
+    } else {
+        controls
+            .cursor
+            .unwrap_or(origin + player.local_y().truncate() * 200.0)
+    };
+    gravity.activate(origin, target);
+}
+
+fn draw_gravity(gravity: Res<GravityWell>, mut gizmos: Gizmos) {
+    if let GravityPhase::Active { center, remaining } = gravity.phase() {
+        let pose = Isometry2d::from_translation(center);
+        gizmos
+            .circle_2d(pose, FIELD_RADIUS, Color::srgb(0.35, 0.6, 1.0))
+            .resolution(64);
+        gizmos
+            .circle_2d(
+                pose,
+                FIELD_RADIUS * (remaining / ACTIVE_DURATION),
+                Color::srgba(0.5, 0.35, 1.0, 0.55),
+            )
+            .resolution(64);
+        gizmos.cross_2d(pose, 8.0, Color::WHITE);
     }
 }
 
@@ -506,6 +589,7 @@ fn move_asteroids(
     players: Query<&Transform, (With<Player>, Without<Asteroid>)>,
     mut asteroids: Query<(&mut Transform, &mut Asteroid), Without<Player>>,
     time: Res<Time<Fixed>>,
+    gravity: Res<GravityWell>,
 ) {
     let player = players
         .single()
@@ -517,6 +601,11 @@ fn move_asteroids(
             .truncate();
         if let Some(lifetime) = asteroid.fragment_lifetime.as_mut() {
             *lifetime -= time.delta_secs();
+            if *lifetime > 0.0 {
+                asteroid.velocity = (asteroid.velocity
+                    + gravity.acceleration(center) * time.delta_secs())
+                .clamp_length_max(MAX_FRAGMENT_SPEED);
+            }
         } else if let Some(player) = player {
             asteroid.velocity = (player - center).normalize_or_zero() * 100.0;
         }
@@ -726,26 +815,43 @@ fn update_hud(
     players: Query<&Health, With<Player>>,
     state: Res<State<GameState>>,
     run: Res<Run>,
-    mut previous: Local<Option<(u32, u32, GameState)>>,
+    gravity: Res<GravityWell>,
+    mut previous: Local<Option<HudSnapshot>>,
 ) {
     let Ok(mut text) = hud.single_mut() else {
         return;
     };
     let hp = players.single().map_or(0, |health| health.0);
-    let snapshot = (hp, run.score, *state.get());
+    let (gravity_label, seconds) = match gravity.phase() {
+        GravityPhase::Ready => ("ready", 0),
+        GravityPhase::Active { remaining, .. } => ("pulling", remaining.ceil() as u32),
+        GravityPhase::Cooldown { remaining } => ("cooldown", remaining.ceil() as u32),
+    };
+    let snapshot = HudSnapshot {
+        health: hp,
+        score: run.score,
+        state: *state.get(),
+        gravity_label,
+        gravity_seconds: seconds,
+    };
     if *previous == Some(snapshot) {
         return;
     }
     *previous = Some(snapshot);
     let status = match state.get() {
         GameState::Playing => {
-            "WASD / arrows: move  |  Mouse: aim  |  Click / Space: shoot  |  Esc: pause"
+            "WASD / arrows: move  |  Mouse: aim  |  Click / Space: shoot  |  Q: gravity  |  Esc: pause"
         }
         GameState::Paused => "PAUSED — Esc / controller Start to resume",
         GameState::GameOver => "GAME OVER — R / Enter / controller East to restart",
     };
+    let gravity_text = if seconds == 0 {
+        gravity_label.to_owned()
+    } else {
+        format!("{gravity_label} {seconds}s")
+    };
     let value = format!(
-        "FENRIR   |   Hull {hp}/4   |   Score {}\n{status}",
+        "FENRIR   |   Hull {hp}/4   |   Score {}   |   Gravity {gravity_text}\n{status}",
         run.score
     );
     if text.0 != value {
@@ -841,6 +947,185 @@ mod tests {
                 GameEntity,
             ))
             .id()
+    }
+
+    #[test]
+    fn gravity_changes_only_in_range_fragment_velocity_and_obeys_speed_cap() {
+        let mut app = game();
+        let near = asteroid(&mut app, Vec2::new(80.0, 100.0));
+        let far = asteroid(&mut app, Vec2::splat(500.0));
+        let center = asteroid(&mut app, Vec2::new(0.0, 100.0));
+        let fast = asteroid(&mut app, Vec2::new(80.0, 100.0));
+        let root = asteroid(&mut app, Vec2::splat(100.0));
+        for entity in [near, far, center, fast] {
+            app.world_mut()
+                .get_mut::<Asteroid>(entity)
+                .unwrap()
+                .fragment_lifetime = Some(FRAGMENT_LIFETIME);
+        }
+        app.world_mut().get_mut::<Asteroid>(fast).unwrap().velocity = Vec2::new(-399.0, 0.0);
+        app.world_mut()
+            .resource_mut::<GravityWell>()
+            .activate(Vec2::ZERO, Vec2::new(0.0, 100.0));
+        app.world_mut().run_system_once(move_asteroids).unwrap();
+        let velocity = |entity| app.world().get::<Asteroid>(entity).unwrap().velocity;
+        assert!(velocity(near).x < 0.0 && velocity(near).y == 0.0);
+        assert_eq!(velocity(far), Vec2::ZERO);
+        assert_eq!(velocity(center), Vec2::ZERO);
+        assert!(velocity(fast).length() <= MAX_FRAGMENT_SPEED);
+        assert!((velocity(root) - Vec2::splat(-1.0).normalize() * 100.0).length() < 0.001);
+    }
+
+    #[test]
+    fn activation_is_latched_across_render_frames_and_consumed_once() {
+        let mut app = game();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>();
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::KeyQ);
+        app.world_mut().run_system_once(sample_controls).unwrap();
+        assert!(app.world().resource::<Controls>().gravity_requested);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .clear();
+        app.world_mut().run_system_once(sample_controls).unwrap();
+        assert!(app.world().resource::<Controls>().gravity_requested);
+        app.world_mut().run_system_once(update_gravity).unwrap();
+        assert!(!app.world().resource::<Controls>().gravity_requested);
+        assert!(matches!(
+            app.world().resource::<GravityWell>().phase(),
+            GravityPhase::Active {
+                remaining: ACTIVE_DURATION,
+                ..
+            }
+        ));
+        app.world_mut().run_system_once(update_gravity).unwrap();
+        assert!(
+            matches!(app.world().resource::<GravityWell>().phase(), GravityPhase::Active { remaining, .. } if remaining < ACTIVE_DURATION)
+        );
+    }
+
+    #[test]
+    fn simultaneous_pause_and_activation_are_resolved_before_simulation() {
+        let mut app = game();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>();
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        configure_input(&mut app);
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.press(KeyCode::KeyQ);
+            keys.press(KeyCode::Escape);
+        }
+        app.update();
+        assert_eq!(
+            *app.world().resource::<State<GameState>>().get(),
+            GameState::Paused
+        );
+        assert_eq!(
+            app.world().resource::<GravityWell>().phase(),
+            GravityPhase::Ready
+        );
+        assert!(!app.world().resource::<Controls>().gravity_requested);
+    }
+
+    #[test]
+    fn controller_trigger_deploys_along_its_aim_direction() {
+        let mut app = game();
+        app.init_resource::<ButtonInput<KeyCode>>()
+            .init_resource::<ButtonInput<MouseButton>>();
+        app.world_mut().spawn((Window::default(), PrimaryWindow));
+        let mut pad = Gamepad::default();
+        pad.analog_mut().set(GamepadAxis::LeftStickX, 1.0);
+        pad.digital_mut().press(GamepadButton::LeftTrigger2);
+        app.world_mut().spawn(pad);
+        app.world_mut().run_system_once(sample_controls).unwrap();
+        app.world_mut().run_system_once(update_gravity).unwrap();
+        assert_eq!(
+            app.world().resource::<GravityWell>().phase(),
+            GravityPhase::Active {
+                center: Vec2::X * DEPLOY_RANGE,
+                remaining: ACTIVE_DURATION,
+            }
+        );
+        assert!(!app.world().resource::<Controls>().gravity_requested);
+    }
+
+    #[test]
+    fn cooldown_requests_are_discarded_and_pause_cannot_queue_activation() {
+        let mut app = game();
+        app.init_resource::<ButtonInput<KeyCode>>();
+        app.world_mut()
+            .resource_mut::<GravityWell>()
+            .activate(Vec2::ZERO, Vec2::Y * 100.0);
+        app.world_mut()
+            .resource_mut::<GravityWell>()
+            .tick(ACTIVE_DURATION);
+        app.world_mut().resource_mut::<Controls>().gravity_requested = true;
+        app.world_mut().run_system_once(update_gravity).unwrap();
+        assert!(!app.world().resource::<Controls>().gravity_requested);
+        app.world_mut()
+            .resource_mut::<GravityWell>()
+            .tick(space_shooter::gravity::COOLDOWN);
+        app.world_mut().run_system_once(update_gravity).unwrap();
+        assert_eq!(
+            app.world().resource::<GravityWell>().phase(),
+            GravityPhase::Ready
+        );
+        app.world_mut()
+            .resource_mut::<NextState<GameState>>()
+            .set(GameState::Paused);
+        app.update();
+        app.world_mut().resource_mut::<Controls>().gravity_requested = true;
+        app.world_mut().run_system_once(handle_state_input).unwrap();
+        assert!(!app.world().resource::<Controls>().gravity_requested);
+    }
+
+    #[test]
+    fn gravity_result_is_consistent_across_render_rates() {
+        let results: Vec<(Vec2, Vec2)> = [30, 60, 144]
+            .into_iter()
+            .map(|fps| {
+                let mut app = game();
+                let piece = asteroid(&mut app, Vec2::new(80.0, 0.0));
+                app.world_mut()
+                    .get_mut::<Asteroid>(piece)
+                    .unwrap()
+                    .fragment_lifetime = Some(FRAGMENT_LIFETIME);
+                {
+                    let mut input = app.world_mut().resource_mut::<Controls>();
+                    input.gravity_requested = true;
+                    input.cursor = Some(Vec2::new(220.0, 0.0));
+                }
+                app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                    1.0 / f64::from(fps),
+                )));
+                for _ in 0..fps * 2 {
+                    app.update();
+                }
+                let body = app.world().get::<Asteroid>(piece).unwrap();
+                let position = app
+                    .world()
+                    .get::<Transform>(piece)
+                    .unwrap()
+                    .transform_point(body.center.extend(0.0))
+                    .truncate();
+                (position, body.velocity)
+            })
+            .collect();
+        for (position, velocity) in &results {
+            assert!(
+                position.distance(results[1].0) <= MAX_FRAGMENT_SPEED / 60.0 + 0.1,
+                "{results:?}"
+            );
+            assert!(
+                velocity.distance(results[1].1)
+                    <= space_shooter::gravity::MAX_ACCELERATION / 60.0 + 0.1,
+                "{results:?}"
+            );
+        }
     }
 
     fn barbell() -> MaterialGrid {
@@ -1368,6 +1653,11 @@ mod tests {
     fn fifty_death_restart_cycles_reset_entities_timers_and_rng() {
         let mut app = game();
         for _ in 0..50 {
+            assert!(
+                app.world_mut()
+                    .resource_mut::<GravityWell>()
+                    .activate(Vec2::ZERO, Vec2::Y * 200.0)
+            );
             app.world_mut().resource_mut::<Controls>().firing = true;
             for _ in 0..65 {
                 app.update();
@@ -1383,6 +1673,7 @@ mod tests {
                         .fragment_lifetime = Some(FRAGMENT_LIFETIME);
                 }
             }
+            app.world_mut().resource_mut::<Controls>().gravity_requested = true;
             app.world_mut().run_system_once(player_collisions).unwrap();
             app.update();
             assert_eq!(
@@ -1391,6 +1682,11 @@ mod tests {
             );
             assert_eq!(count::<GameEntity>(&mut app), 0);
             assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+            assert_eq!(
+                app.world().resource::<GravityWell>().phase(),
+                GravityPhase::Ready
+            );
+            assert!(!app.world().resource::<Controls>().gravity_requested);
             app.world_mut().resource_mut::<Controls>().firing = false;
             app.world_mut()
                 .resource_mut::<NextState<GameState>>()
@@ -1415,6 +1711,10 @@ mod tests {
     #[test]
     fn pause_freezes_simulation_and_resume_keeps_player() {
         let mut app = game();
+        app.world_mut()
+            .resource_mut::<GravityWell>()
+            .activate(Vec2::ZERO, Vec2::Y * 200.0);
+        let phase = app.world().resource::<GravityWell>().phase();
         let fragment = asteroid(&mut app, Vec2::splat(1000.0));
         app.world_mut()
             .get_mut::<Asteroid>(fragment)
@@ -1439,6 +1739,7 @@ mod tests {
             0.0
         );
         assert_eq!(app.world().resource::<Run>().spawn.elapsed(), elapsed);
+        assert_eq!(app.world().resource::<GravityWell>().phase(), phase);
         assert_eq!(
             app.world()
                 .get::<Asteroid>(fragment)

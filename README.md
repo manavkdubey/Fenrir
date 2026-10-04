@@ -2,8 +2,9 @@
 
 A Rust/Bevy 2D space shooter being developed into a destructible-asteroid action game.
 The current foundation includes movement, aiming, shooting, homing asteroids, health,
-score, pause, clean restart, localized asteroid damage, and independent fragments.
-The gravity weapon and bounded chain reactions are planned; they are not implemented yet.
+score, pause, clean restart, localized asteroid damage, independent fragments, and a
+fragment-attracting gravity field. Detonation and bounded chain reactions are planned;
+they are not implemented yet.
 
 ## Run
 
@@ -27,6 +28,7 @@ When launching a standalone binary, place `assets` next to it or set
 | Move | WASD or arrow keys | Right stick |
 | Aim | Mouse cursor | Left stick |
 | Fire | Hold left click or Space | Hold right trigger |
+| Gravity field | Q | Left trigger |
 | Pause / resume | Escape | Start |
 | Restart after death | R or Enter | East face button |
 
@@ -73,6 +75,23 @@ re-fracturing preserves their remaining lifetime, and pause freezes that lifetim
 Only complete projectile destruction of the original body's retained region scores
 a point. Detached fragments do not award additional points.
 
+The gravity field deploys at the mouse cursor, or 300 units along an active controller
+aim stick. With no cursor or stick input it deploys 200 units ahead of the ship.
+Deployment is clamped to 300 units from the ship. One field is active at a time:
+two seconds of attraction, followed by eight seconds of cooldown. Activation is a
+single press, buffered until the next simulation tick; presses during cooldown or
+pause are discarded. Death and restart reset the field. The HUD shows its phase
+and remaining seconds; an outer circle shows the 220-unit range and a shrinking
+circle shows the remaining active time.
+
+Only fragments are pulled. At distance `r < 220`, with offset vector `d` pointing
+to the field centre, acceleration is `700 * d / max(r, 24) * (1 - r / 220)` in
+world units/second². Force is zero at the centre and outside the range. The soft
+core avoids a singularity; the existing 400 units/second fragment speed cap still
+applies. Homing asteroids, bullets, and the player retain their existing movement.
+Fragment lifetime continues during attraction and freezes on pause. This slice
+does not detonate or apply explosion damage.
+
 Collision still checks bullet/asteroid pairs, with up to 1,024 cell tests for each
 broad-phase candidate. Optimization needs measured scenarios before introducing a
 spatial index. This is not continuous collision against a moving/rotating rigid body.
@@ -88,19 +107,21 @@ Headless tests cover swept-hit edge cases, simultaneous hits, frame-rate-indepen
 movement, projectile expiry, entity caps, pause/resume, finite asteroid motion,
 localized damage, rotated grid collision, image/mask agreement, seeded geometry
 properties, exact component partitioning, fragment caps and expiry, rotation around
-material centres, and image cleanup over 50 death/restart cycles with active debris.
+material centres, gravity bounds and cooldown, buffered keyboard/controller
+activation, and cleanup over 50 death/restart cycles with active debris and fields.
 Actual rendering and physical input require a desktop smoke test. No performance
 benchmark or FPS claim has been established.
 
 `src/main.rs` contains the gameplay systems and integration tests. `src/asteroid.rs`
 contains the material grid, connected-component partitioning, local collision
 geometry, and geometry tests.
-`src/state.rs` defines the run states. The library exports the geometry and states.
+`src/gravity.rs` contains the field state machine and bounded force model.
+`src/state.rs` defines the run states. The library exports these modules.
 
 ## Next milestones
 
-The next milestones are a gravity weapon, bounded chain reactions, and reproducible
-performance scenarios. Those features remain subject to their design review.
+The next milestones are gravity detonation, bounded chain reactions, and
+reproducible performance scenarios. Those features remain subject to their design review.
 The project is not yet a finished portfolio release.
 
 ## License

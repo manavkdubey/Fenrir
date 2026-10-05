@@ -3,8 +3,8 @@
 A Rust/Bevy 2D space shooter being developed into a destructible-asteroid action game.
 The current foundation includes movement, aiming, shooting, homing asteroids, health,
 score, pause, clean restart, localized asteroid damage, independent fragments, and a
-fragment-attracting gravity field. Detonation and bounded chain reactions are planned;
-they are not implemented yet.
+fragment-attracting gravity field with automatic detonation. Bounded secondary
+chain reactions are planned; they are not implemented yet.
 
 ## Run
 
@@ -72,14 +72,14 @@ cells or exceeding the budget are discarded. The largest region is retained even
 when smaller than that threshold. At most 64 fragments may be active, sharing the
 128-body asteroid cap. Fragments expire after eight simulation seconds;
 re-fracturing preserves their remaining lifetime, and pause freezes that lifetime.
-Only complete projectile destruction of the original body's retained region scores
-a point. Detached fragments do not award additional points.
+Only complete projectile or blast destruction of the original body's retained
+region scores a point. Detached fragments do not award additional points.
 
 The gravity field deploys at the mouse cursor, or 300 units along an active controller
 aim stick. With no cursor or stick input it deploys 200 units ahead of the ship.
 Deployment is clamped to 300 units from the ship. One field is active at a time:
-two seconds of attraction, followed by eight seconds of cooldown. Activation is a
-single press, buffered until the next simulation tick; presses during cooldown or
+two seconds of attraction, one automatic blast, then eight seconds of cooldown.
+Activation is a single press, buffered until the next simulation tick; presses during cooldown or
 pause are discarded. Death and restart reset the field. The HUD shows its phase
 and remaining seconds; an outer circle shows the 220-unit range and a shrinking
 circle shows the remaining active time.
@@ -89,8 +89,21 @@ to the field centre, acceleration is `700 * d / max(r, 24) * (1 - r / 220)` in
 world units/second². Force is zero at the centre and outside the range. The soft
 core avoids a singularity; the existing 400 units/second fragment speed cap still
 applies. Homing asteroids, bullets, and the player retain their existing movement.
-Fragment lifetime continues during attraction and freezes on pause. This slice
-does not detonate or apply explosion damage.
+Fragment lifetime continues during attraction and freezes on pause.
+
+Detonation erases occupied cell centres within 120 world units, including material
+on bodies whose origin is outside that radius. A rotated body's grid uses the same
+world-space circle. Surviving fragments get an outward velocity change of
+`250 * d / max(r, 24) * (1 - r / 120)` for `r < 120`, with the existing speed cap.
+Intact bodies keep their homing movement. The player and bullets receive no blast
+damage or force.
+
+Damage is a single-use request consumed once per fixed step. Projectile hits resolve
+first, then the blast, then splitting, then player contacts. Blast-created fragments
+use the existing spawn limits. The orange pulse lasts 0.35 simulation seconds and
+only presents the result; its expanding rings do not repeat damage. Pause freezes
+both the timer and pulse; death/restart clear pending damage and visual state.
+Secondary explosions and chain reactions are not implemented yet.
 
 Collision still checks bullet/asteroid pairs, with up to 1,024 cell tests for each
 broad-phase candidate. Optimization needs measured scenarios before introducing a
@@ -108,20 +121,23 @@ movement, projectile expiry, entity caps, pause/resume, finite asteroid motion,
 localized damage, rotated grid collision, image/mask agreement, seeded geometry
 properties, exact component partitioning, fragment caps and expiry, rotation around
 material centres, gravity bounds and cooldown, buffered keyboard/controller
-activation, and cleanup over 50 death/restart cycles with active debris and fields.
+activation, blast-edge damage, projectile/blast overlap, one-shot detonation,
+matching detonation outcomes at different render rates, and cleanup over 50
+death/restart cycles with active debris, fields, and pending blasts.
 Actual rendering and physical input require a desktop smoke test. No performance
 benchmark or FPS claim has been established.
 
 `src/main.rs` contains the gameplay systems and integration tests. `src/asteroid.rs`
 contains the material grid, connected-component partitioning, local collision
 geometry, and geometry tests.
-`src/gravity.rs` contains the field state machine and bounded force model.
+`src/gravity.rs` contains the field state machine, single-use detonation request,
+visual pulse lifetime, and bounded attraction/knockback model.
 `src/state.rs` defines the run states. The library exports these modules.
 
 ## Next milestones
 
-The next milestones are gravity detonation, bounded chain reactions, and
-reproducible performance scenarios. Those features remain subject to their design review.
+The next milestones are bounded chain reactions and reproducible performance
+scenarios. Those features remain subject to their design review.
 The project is not yet a finished portfolio release.
 
 ## License

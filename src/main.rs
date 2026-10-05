@@ -11,7 +11,10 @@ use bevy::{
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use space_shooter::{
     asteroid::{GRID_SIZE, MaterialGrid},
-    gravity::{ACTIVE_DURATION, DEPLOY_RANGE, FIELD_RADIUS, GravityPhase, GravityWell},
+    gravity::{
+        ACTIVE_DURATION, BLAST_RADIUS, DEPLOY_RANGE, FIELD_RADIUS, GravityPhase, GravityWell,
+        PULSE_DURATION, blast_velocity,
+    },
     state::GameState,
 };
 
@@ -183,6 +186,7 @@ fn configure_gameplay(app: &mut App) {
                 move_asteroids,
                 expire_fragments,
                 bullet_collisions,
+                apply_detonation,
                 split_asteroids,
                 player_collisions,
                 expire_bullets,
@@ -421,6 +425,24 @@ fn draw_gravity(gravity: Res<GravityWell>, mut gizmos: Gizmos) {
             )
             .resolution(64);
         gizmos.cross_2d(pose, 8.0, Color::WHITE);
+    }
+    if let Some(pulse) = gravity.pulse() {
+        let fraction = (pulse.remaining / PULSE_DURATION).clamp(0.0, 1.0);
+        let pose = Isometry2d::from_translation(pulse.center);
+        gizmos
+            .circle_2d(
+                pose,
+                BLAST_RADIUS,
+                Color::srgba(1.0, 0.45, 0.1, fraction * 0.4),
+            )
+            .resolution(64);
+        gizmos
+            .circle_2d(
+                pose,
+                BLAST_RADIUS * (1.0 - fraction),
+                Color::srgba(1.0, 0.8, 0.25, fraction),
+            )
+            .resolution(64);
     }
 }
 
@@ -759,16 +781,60 @@ fn bullet_collisions(
             };
             let impact = asteroid_local(transform, start.lerp(end, t));
             asteroid.material.remove_circle(impact, CRATER_RADIUS);
-            asteroid.fracture_pending = true;
             commands.entity(bullet_entity).despawn();
-            if asteroid.material.is_empty() {
-                despawn_asteroid(&mut commands, &mut images, entity, &asteroid);
-                if asteroid.fragment_lifetime.is_none() {
-                    run.score += 1;
-                }
-            } else {
-                damage_surface(&asteroid, &mut images);
-            }
+            resolve_material_damage(&mut commands, &mut images, &mut run, entity, &mut asteroid);
+        }
+    }
+}
+
+fn resolve_material_damage(
+    commands: &mut Commands,
+    images: &mut Assets<Image>,
+    run: &mut Run,
+    entity: Entity,
+    asteroid: &mut Asteroid,
+) {
+    asteroid.fracture_pending = true;
+    if asteroid.material.is_empty() {
+        despawn_asteroid(commands, images, entity, asteroid);
+        if asteroid.fragment_lifetime.is_none() {
+            run.score += 1;
+        }
+    } else {
+        damage_surface(asteroid, images);
+    }
+}
+
+fn apply_detonation(
+    mut commands: Commands,
+    mut gravity: ResMut<GravityWell>,
+    mut asteroids: Query<(Entity, &Transform, &mut Asteroid)>,
+    mut images: ResMut<Assets<Image>>,
+    mut run: ResMut<Run>,
+) {
+    let Some(center) = gravity.take_detonation() else {
+        return;
+    };
+    for (entity, transform, mut asteroid) in &mut asteroids {
+        if asteroid.fragment_lifetime.is_some() {
+            let position = transform
+                .transform_point(asteroid.center.extend(0.0))
+                .truncate();
+            asteroid.velocity = (asteroid.velocity + blast_velocity(center, position))
+                .clamp_length_max(MAX_FRAGMENT_SPEED);
+        }
+        let bound = GRID_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2 * transform.scale.x;
+        if transform.translation.truncate().distance_squared(center)
+            > (BLAST_RADIUS + bound).powi(2)
+        {
+            continue;
+        }
+        let removed = asteroid.material.remove_circle(
+            asteroid_local(transform, center),
+            BLAST_RADIUS / transform.scale.x,
+        );
+        if removed > 0 {
+            resolve_material_damage(&mut commands, &mut images, &mut run, entity, &mut asteroid);
         }
     }
 }
@@ -949,6 +1015,221 @@ mod tests {
             .id()
     }
 
+    fn queue_detonation(app: &mut App, center: Vec2) {
+        let mut well = app.world_mut().resource_mut::<GravityWell>();
+        assert!(well.activate(center, center));
+        well.tick(ACTIVE_DURATION);
+    }
+
+    #[test]
+    fn blast_edge_erases_world_space_cells_once_in_a_rotated_body() {
+        let mut app = game();
+        let rock = asteroid(&mut app, Vec2::new(BLAST_RADIUS, 0.0));
+        app.world_mut().get_mut::<Transform>(rock).unwrap().rotation = Quat::from_rotation_z(0.73);
+        let pose = *app.world().get::<Transform>(rock).unwrap();
+        queue_detonation(&mut app, Vec2::ZERO);
+        app.world_mut().run_system_once(apply_detonation).unwrap();
+        let body = app.world().get::<Asteroid>(rock).unwrap();
+        assert!(
+            body.material.cell_count() > 0
+                && body.material.cell_count() < (GRID_SIZE * GRID_SIZE) as u32
+        );
+        let remaining = body.material.clone();
+        let image = app
+            .world()
+            .resource::<Assets<Image>>()
+            .get(&body.image)
+            .unwrap();
+        for y in 0..GRID_SIZE {
+            for x in 0..GRID_SIZE {
+                let local = Vec3::new(x as f32 + 0.5 - 16.0, 16.0 - y as f32 - 0.5, 0.0);
+                let world = pose.transform_point(local).truncate();
+                assert_eq!(
+                    body.material.occupied(x, y),
+                    world.length_squared() > BLAST_RADIUS * BLAST_RADIUS
+                );
+                assert_eq!(
+                    image.data.as_ref().unwrap()[(y * GRID_SIZE + x) * 4 + 3] > 0,
+                    body.material.occupied(x, y)
+                );
+            }
+        }
+        app.world_mut().resource_mut::<GravityWell>().tick(0.1);
+        app.world_mut().run_system_once(apply_detonation).unwrap();
+        assert_eq!(
+            app.world().get::<Asteroid>(rock).unwrap().material,
+            remaining
+        );
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn blast_cut_uses_the_existing_split_and_fragment_budget_path() {
+        let mut app = game();
+        let rock = asteroid_with_material(&mut app, Vec2::ZERO, barbell());
+        queue_detonation(&mut app, Vec2::new(0.0, -BLAST_RADIUS));
+        app.world_mut().run_system_once(apply_detonation).unwrap();
+        let damaged = app.world().get::<Asteroid>(rock).unwrap().material.clone();
+        assert_eq!(damaged.components().len(), 2);
+        app.world_mut().run_system_once(split_asteroids).unwrap();
+        assert_eq!(count::<Asteroid>(&mut app), 2);
+        let mut bodies = app.world_mut().query::<&Asteroid>();
+        assert_eq!(
+            bodies
+                .iter(app.world())
+                .map(|body| body.material.cell_count())
+                .sum::<u32>(),
+            damaged.cell_count()
+        );
+        assert_eq!(
+            bodies
+                .iter(app.world())
+                .filter(|body| body.fragment_lifetime.is_some())
+                .count(),
+            1
+        );
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn projectile_hits_then_blast_score_once_and_leave_player_and_other_bullets_safe() {
+        let mut app = game();
+        let root = asteroid(&mut app, Vec2::new(60.0, 0.0));
+        let fragment = asteroid(&mut app, Vec2::new(60.0, 0.0));
+        app.world_mut()
+            .get_mut::<Asteroid>(fragment)
+            .unwrap()
+            .fragment_lifetime = Some(FRAGMENT_LIFETIME);
+        let first = bullet(&mut app, Vec2::new(60.0, 0.0), Vec2::new(60.0, 0.0));
+        let second = bullet(&mut app, Vec2::new(60.0, 0.0), Vec2::new(60.0, 0.0));
+        let untouched = bullet(&mut app, Vec2::new(10.0, 0.0), Vec2::new(10.0, 0.0));
+        queue_detonation(&mut app, Vec2::ZERO);
+        app.update();
+        for entity in [root, fragment, first, second] {
+            assert!(app.world().get_entity(entity).is_err());
+        }
+        assert!(app.world().get_entity(untouched).is_ok());
+        assert_eq!(app.world().resource::<Run>().score, 1);
+        assert_eq!(
+            app.world_mut()
+                .query::<&Health>()
+                .single(app.world())
+                .unwrap()
+                .0,
+            4
+        );
+        assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+        app.update();
+        assert_eq!(app.world().resource::<Run>().score, 1);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<GravityWell>()
+                .take_detonation(),
+            None
+        );
+    }
+
+    #[test]
+    fn blast_knockback_is_capped_and_out_of_range_material_is_unchanged() {
+        let mut app = game();
+        let edge = asteroid(&mut app, Vec2::new(BLAST_RADIUS - 5.0, 0.0));
+        let outside = asteroid(&mut app, Vec2::new(300.0, 0.0));
+        for entity in [edge, outside] {
+            let mut body = app.world_mut().get_mut::<Asteroid>(entity).unwrap();
+            body.fragment_lifetime = Some(4.0);
+            body.velocity = Vec2::X * 399.0;
+        }
+        queue_detonation(&mut app, Vec2::ZERO);
+        app.world_mut().run_system_once(apply_detonation).unwrap();
+        let body = app.world().get::<Asteroid>(edge).unwrap();
+        assert_eq!(body.velocity, Vec2::X * MAX_FRAGMENT_SPEED);
+        assert!(body.material.cell_count() < (GRID_SIZE * GRID_SIZE) as u32);
+        assert_eq!(body.fragment_lifetime, Some(4.0));
+        let body = app.world().get::<Asteroid>(outside).unwrap();
+        assert_eq!(body.velocity, Vec2::X * 399.0);
+        assert_eq!(body.material.cell_count(), (GRID_SIZE * GRID_SIZE) as u32);
+        assert_eq!(app.world().resource::<Run>().score, 0);
+    }
+
+    #[test]
+    fn paused_detonation_and_pulse_wait_for_resume_and_then_apply_once() {
+        let mut app = game();
+        let rock = asteroid(&mut app, Vec2::new(400.0, 0.0));
+        queue_detonation(&mut app, Vec2::new(400.0, 0.0));
+        let pulse = app.world().resource::<GravityWell>().pulse();
+        app.world_mut()
+            .resource_mut::<NextState<GameState>>()
+            .set(GameState::Paused);
+        for _ in 0..120 {
+            app.update();
+        }
+        assert_eq!(app.world().resource::<GravityWell>().pulse(), pulse);
+        assert_eq!(
+            app.world()
+                .get::<Asteroid>(rock)
+                .unwrap()
+                .material
+                .cell_count(),
+            (GRID_SIZE * GRID_SIZE) as u32
+        );
+        app.world_mut()
+            .resource_mut::<NextState<GameState>>()
+            .set(GameState::Playing);
+        app.update();
+        assert!(app.world().get_entity(rock).is_err());
+        assert_eq!(app.world().resource::<Run>().score, 1);
+        assert_eq!(
+            app.world_mut()
+                .resource_mut::<GravityWell>()
+                .take_detonation(),
+            None
+        );
+    }
+
+    #[test]
+    fn automatic_detonation_has_matching_outcomes_across_render_rates() {
+        for fps in [30, 60, 144] {
+            let mut app = game();
+            app.world_mut().resource_mut::<Run>().spawn =
+                Timer::from_seconds(100.0, TimerMode::Repeating);
+            let mut rows = [0; GRID_SIZE];
+            rows[16] = 1 << 16;
+            let fragment = asteroid_with_material(
+                &mut app,
+                Vec2::new(220.0, 0.0),
+                MaterialGrid::from_rows(rows),
+            );
+            app.world_mut()
+                .get_mut::<Asteroid>(fragment)
+                .unwrap()
+                .fragment_lifetime = Some(FRAGMENT_LIFETIME);
+            let root = asteroid_with_material(
+                &mut app,
+                Vec2::new(340.0, 0.0),
+                MaterialGrid::from_rows(rows),
+            );
+            {
+                let mut controls = app.world_mut().resource_mut::<Controls>();
+                controls.cursor = Some(Vec2::new(220.0, 0.0));
+                controls.gravity_requested = true;
+            }
+            app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
+                1.0 / f64::from(fps),
+            )));
+            for _ in 0..fps * 3 {
+                app.update();
+            }
+            assert!(app.world().get_entity(fragment).is_err());
+            assert!(app.world().get_entity(root).is_err());
+            assert_eq!(app.world().resource::<Run>().score, 1);
+            assert_eq!(app.world().resource::<GravityWell>().pulse(), None);
+            assert!(
+                matches!(app.world().resource::<GravityWell>().phase(), GravityPhase::Cooldown { remaining } if (remaining - 7.0).abs() < 0.04)
+            );
+            assert_eq!(app.world().resource::<Assets<Image>>().len(), 1);
+        }
+    }
+
     #[test]
     fn gravity_changes_only_in_range_fragment_velocity_and_obeys_speed_cap() {
         let mut app = game();
@@ -1102,7 +1383,7 @@ mod tests {
                 app.insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_secs_f64(
                     1.0 / f64::from(fps),
                 )));
-                for _ in 0..fps * 2 {
+                for _ in 0..fps * 3 / 2 {
                     app.update();
                 }
                 let body = app.world().get::<Asteroid>(piece).unwrap();
@@ -1673,6 +1954,14 @@ mod tests {
                         .fragment_lifetime = Some(FRAGMENT_LIFETIME);
                 }
             }
+            let remaining = match app.world().resource::<GravityWell>().phase() {
+                GravityPhase::Active { remaining, .. } => remaining,
+                _ => panic!("field should still be active before death"),
+            };
+            app.world_mut()
+                .resource_mut::<GravityWell>()
+                .tick(remaining);
+            assert!(app.world().resource::<GravityWell>().pulse().is_some());
             app.world_mut().resource_mut::<Controls>().gravity_requested = true;
             app.world_mut().run_system_once(player_collisions).unwrap();
             app.update();
@@ -1687,6 +1976,13 @@ mod tests {
                 GravityPhase::Ready
             );
             assert!(!app.world().resource::<Controls>().gravity_requested);
+            assert_eq!(app.world().resource::<GravityWell>().pulse(), None);
+            assert_eq!(
+                app.world_mut()
+                    .resource_mut::<GravityWell>()
+                    .take_detonation(),
+                None
+            );
             app.world_mut().resource_mut::<Controls>().firing = false;
             app.world_mut()
                 .resource_mut::<NextState<GameState>>()

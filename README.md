@@ -3,8 +3,8 @@
 A Rust/Bevy 2D space shooter being developed into a destructible-asteroid action game.
 The current foundation includes movement, aiming, shooting, homing asteroids, health,
 score, pause, clean restart, localized asteroid damage, independent fragments, and a
-fragment-attracting gravity field with automatic detonation. Bounded secondary
-chain reactions are planned; they are not implemented yet.
+fragment-attracting gravity field with automatic detonation and bounded secondary
+chain reactions.
 
 ## Run
 
@@ -98,12 +98,29 @@ world-space circle. Surviving fragments get an outward velocity change of
 Intact bodies keep their homing movement. The player and bullets receive no blast
 damage or force.
 
-Damage is a single-use request consumed once per fixed step. Projectile hits resolve
-first, then the blast, then splitting, then player contacts. Blast-created fragments
-use the existing spawn limits. The orange pulse lasts 0.35 simulation seconds and
-only presents the result; its expanding rings do not repeat damage. Pause freezes
-both the timer and pulse; death/restart clear pending damage and visual state.
-Secondary explosions and chain reactions are not implemented yet.
+A gravity detonation starts one explosion chain. A body destroyed by a blast can
+schedule a secondary explosion if it had at least 16 occupied cells immediately
+before that fatal hit. Projectile kills, expired fragments, and smaller debris do
+not trigger explosions. Original bodies score once; detached fragments do not
+award extra points. Victims are processed in stable entity order when trigger
+slots are limited. Empty material marks a body as dead immediately, preventing
+duplicate scoring or triggers while entity despawns are deferred.
+
+Secondary explosions have a 60-unit radius and a lower outward velocity scale of
+150 units/second. They wait 80 simulation milliseconds before becoming eligible.
+Each chain reserves a maximum of 12 total blasts, including the primary, and stops
+after three secondary generations. Across all chains, at most two blasts are
+processed per fixed tick. At most four chains with queued work and 48 queued blasts
+may be retained;
+additional starts or triggers are discarded. Budgets are reserved when events are
+queued and are not replenished when events execute.
+
+Projectile hits resolve first, then ready blasts, then splitting, then player
+contacts. Blast-created fragments use the existing spawn limits. Primary orange
+and secondary red pulses last 0.35 simulation seconds and only present results;
+their expanding rings do not repeat damage. Visuals have a separate 32-pulse cap,
+which drops the oldest pulse when full. Pause freezes propagation and effects;
+death/restart clear queued blasts, chain records, and visual state.
 
 Collision still checks bullet/asteroid pairs, with up to 1,024 cell tests for each
 broad-phase candidate. Optimization needs measured scenarios before introducing a
@@ -123,21 +140,24 @@ properties, exact component partitioning, fragment caps and expiry, rotation aro
 material centres, gravity bounds and cooldown, buffered keyboard/controller
 activation, blast-edge damage, projectile/blast overlap, one-shot detonation,
 matching detonation outcomes at different render rates, and cleanup over 50
-death/restart cycles with active debris, fields, and pending blasts.
+death/restart cycles with active debris, fields, and pending blasts. Tests also
+cover chain depth, total/tick/storage caps, overlapping chains, stable trigger
+selection after archetype changes, and matching outcomes at 30/60/144 render FPS.
 Actual rendering and physical input require a desktop smoke test. No performance
 benchmark or FPS claim has been established.
 
 `src/main.rs` contains the gameplay systems and integration tests. `src/asteroid.rs`
 contains the material grid, connected-component partitioning, local collision
 geometry, and geometry tests.
-`src/gravity.rs` contains the field state machine, single-use detonation request,
-visual pulse lifetime, and bounded attraction/knockback model.
+`src/gravity.rs` contains the field state machine, single-use primary detonation
+request, and bounded attraction model. `src/explosion.rs` owns the shared blast
+queue, chain budgets, pulse lifetimes, and outward velocity model.
 `src/state.rs` defines the run states. The library exports these modules.
 
 ## Next milestones
 
-The next milestones are bounded chain reactions and reproducible performance
-scenarios. Those features remain subject to their design review.
+The next milestones are reproducible performance scenarios, instrumentation, and
+visual/gameplay polish. Those features remain subject to their design review.
 The project is not yet a finished portfolio release.
 
 ## License

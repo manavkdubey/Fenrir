@@ -31,6 +31,7 @@ When launching a standalone binary, place `assets` next to it or set
 | Gravity field | Q | Left trigger |
 | Pause / resume | Escape | Start |
 | Restart after death | R or Enter | East face button |
+| Performance overlay | F3 | — |
 
 An active gamepad aiming stick takes precedence over mouse aim. One connected
 controller owns the ship; additional devices do not multiply movement or fire rate.
@@ -143,8 +144,22 @@ matching detonation outcomes at different render rates, and cleanup over 50
 death/restart cycles with active debris, fields, and pending blasts. Tests also
 cover chain depth, total/tick/storage caps, overlapping chains, stable trigger
 selection after archetype changes, and matching outcomes at 30/60/144 render FPS.
-Actual rendering and physical input require a desktop smoke test. No performance
-benchmark or FPS claim has been established.
+Actual rendering and physical input require a desktop smoke test.
+
+## Performance measurement
+
+Press **F3** for bounded frame/simulation history, collision work, entity counts,
+and queued blasts. Run the seeded headless scenario with:
+
+```sh
+cargo run --release --locked -- --benchmark --seed 42 --ticks 600 --warmup 120 --repeats 5
+```
+
+The runner checks matching outcome snapshots and work counts across repetitions
+and reports mean/p50/p95/p99 timings. See [BENCHMARKS.md](BENCHMARKS.md) for the
+fixture, clock boundaries, machine/compiler details, and recorded baseline.
+Headless timings measure simulation work; rendered frame and GPU timings require
+separate measurement. No rendered FPS or optimization speedup is claimed.
 
 `src/main.rs` contains the gameplay systems and integration tests. `src/asteroid.rs`
 contains the material grid, connected-component partitioning, local collision
@@ -152,12 +167,14 @@ geometry, and geometry tests.
 `src/gravity.rs` contains the field state machine, single-use primary detonation
 request, and bounded attraction model. `src/explosion.rs` owns the shared blast
 queue, chain budgets, pulse lifetimes, and outward velocity model.
-`src/state.rs` defines the run states. The library exports these modules.
+`src/observability.rs` owns bounded samples, counters, and percentile calculation;
+`src/scenario.rs` drives the headless benchmark through the game systems.
+`src/state.rs` defines the run states.
 
 ## Next milestones
 
-The next milestones are reproducible performance scenarios, instrumentation, and
-visual/gameplay polish. Those features remain subject to their design review.
+The next milestones are measured collision improvements and visual/gameplay
+polish. Those features remain subject to their design review.
 The project is not yet a finished portfolio release.
 
 ## License

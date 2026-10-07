@@ -1,4 +1,6 @@
-use std::time::Duration;
+mod scenario;
+
+use std::time::{Duration, Instant};
 
 use bevy::{
     asset::RenderAssetUsages,
@@ -13,11 +15,13 @@ use space_shooter::{
     asteroid::{GRID_SIZE, MaterialGrid},
     explosion::{Explosions, MIN_TRIGGER_CELLS, PULSE_DURATION},
     gravity::{ACTIVE_DURATION, DEPLOY_RANGE, FIELD_RADIUS, GravityPhase, GravityWell},
+    observability::{Performance, WorkCounts},
     state::GameState,
 };
 
 const PLAYER_SPEED: f32 = 240.0;
 const BULLET_SPEED: f32 = 500.0;
+const BULLET_LIFETIME: f32 = 3.0;
 const ASTEROID_SCALE: f32 = 2.0;
 const CRATER_RADIUS: f32 = 4.0;
 const PLAYER_RADIUS: f32 = 14.0;
@@ -59,6 +63,15 @@ struct GameEntity;
 
 #[derive(Component)]
 struct Hud;
+
+#[derive(Component)]
+struct PerformanceOverlay;
+
+#[derive(Default)]
+struct OverlayState {
+    visible: bool,
+    elapsed: f64,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct HudSnapshot {
@@ -131,6 +144,15 @@ impl Default for Run {
 }
 
 fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match scenario::command(&args) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+    }
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -143,7 +165,10 @@ fn main() {
     }))
     .insert_resource(ClearColor(Color::srgb(0.015, 0.02, 0.04)))
     .add_systems(Startup, setup_view)
-    .add_systems(Update, (update_hud, draw_gravity));
+    .add_systems(
+        Update,
+        (update_hud, draw_gravity, update_performance_overlay),
+    );
     configure_gameplay(&mut app);
     configure_input(&mut app);
     app.run();
@@ -165,6 +190,7 @@ fn configure_gameplay(app: &mut App) {
     app.insert_resource(virtual_time)
         .insert_resource(Time::<Fixed>::from_hz(60.0))
         .init_resource::<Controls>()
+        .init_resource::<Performance>()
         .init_resource::<GravityWell>()
         .init_resource::<Explosions>()
         .init_resource::<Arena>()
@@ -177,6 +203,7 @@ fn configure_gameplay(app: &mut App) {
         .add_systems(
             FixedUpdate,
             (
+                begin_simulation_sample,
                 move_player,
                 update_gravity,
                 shoot,
@@ -189,11 +216,20 @@ fn configure_gameplay(app: &mut App) {
                 split_asteroids,
                 player_collisions,
                 expire_bullets,
+                finish_simulation_sample,
             )
                 .chain()
                 .run_if(in_state(GameState::Playing))
                 .run_if(player_alive),
         );
+}
+
+fn begin_simulation_sample(mut performance: ResMut<Performance>) {
+    performance.begin_tick();
+}
+
+fn finish_simulation_sample(mut performance: ResMut<Performance>) {
+    performance.finish_tick();
 }
 
 fn player_alive(players: Query<&Health, With<Player>>) -> bool {
@@ -202,6 +238,20 @@ fn player_alive(players: Query<&Health, With<Player>>) -> bool {
 
 fn setup_view(mut commands: Commands, asset_server: Res<AssetServer>) {
     commands.spawn(Camera2d);
+    commands.spawn((
+        PerformanceOverlay,
+        Text::default(),
+        TextFont::from_font_size(16.0),
+        Node {
+            display: Display::None,
+            position_type: PositionType::Absolute,
+            right: px(16),
+            bottom: px(16),
+            padding: UiRect::all(px(8)),
+            ..default()
+        },
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.85)),
+    ));
     commands.spawn((
         Text::default(),
         TextFont {
@@ -467,7 +517,7 @@ fn shoot(
         Bullet {
             velocity: player.local_y().truncate() * BULLET_SPEED,
             previous: position,
-            remaining: 3.0,
+            remaining: BULLET_LIFETIME,
         },
         GameEntity,
         Sprite::from_image(assets.bullet.clone()),
@@ -572,9 +622,13 @@ fn asteroid_hit(
     material: &MaterialGrid,
     start: Vec2,
     end: Vec2,
+    work: &mut WorkCounts,
 ) -> Option<f32> {
+    work.bullet_pairs += 1;
     let radius = GRID_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2 * transform.scale.x;
     segment_circle_hit(start, end, transform.translation.truncate(), radius)?;
+    work.narrow_candidates += 1;
+    work.projectile_cell_tests += u64::from(material.cell_count());
     material.ray_hit(
         asteroid_local(transform, start),
         asteroid_local(transform, end),
@@ -660,6 +714,7 @@ fn split_asteroids(
     mut commands: Commands,
     mut asteroids: Query<(&Transform, &mut Asteroid)>,
     mut images: ResMut<Assets<Image>>,
+    mut performance: ResMut<Performance>,
 ) {
     let body_count = asteroids.iter().count();
     let fragment_count = asteroids
@@ -673,6 +728,7 @@ fn split_asteroids(
         if !asteroid.fracture_pending {
             continue;
         }
+        performance.current.work.split_bodies += 1;
         asteroid.fracture_pending = false;
         let mut parts = asteroid.material.components().into_iter();
         let Some(largest) = parts.next() else {
@@ -731,6 +787,7 @@ fn split_asteroids(
                 Sprite::from_image(image),
                 *transform,
             ));
+            performance.current.work.new_fragments += 1;
             budget -= 1;
         }
         damage_surface(&asteroid, &mut images);
@@ -763,14 +820,23 @@ fn bullet_collisions(
     mut asteroids: Query<(Entity, &Transform, &mut Asteroid)>,
     mut images: ResMut<Assets<Image>>,
     mut run: ResMut<Run>,
+    mut performance: ResMut<Performance>,
 ) {
+    let started = Instant::now();
     for (bullet_entity, transform, bullet) in &bullets {
         let start = bullet.previous;
         let end = transform.translation.truncate();
         let hit = asteroids
             .iter()
             .filter_map(|(entity, transform, asteroid)| {
-                asteroid_hit(transform, &asteroid.material, start, end).map(|t| (entity, t))
+                asteroid_hit(
+                    transform,
+                    &asteroid.material,
+                    start,
+                    end,
+                    &mut performance.current.work,
+                )
+                .map(|t| (entity, t))
             })
             .min_by(|(ea, ta), (eb, tb)| {
                 ta.total_cmp(tb)
@@ -786,6 +852,7 @@ fn bullet_collisions(
             resolve_material_damage(&mut commands, &mut images, &mut run, entity, &mut asteroid);
         }
     }
+    performance.current.collision_ms = started.elapsed().as_secs_f64() * 1000.0;
 }
 
 fn resolve_material_damage(
@@ -813,13 +880,16 @@ fn apply_detonation(
     mut asteroids: Query<(Entity, &Transform, &mut Asteroid)>,
     mut images: ResMut<Assets<Image>>,
     mut run: ResMut<Run>,
-    time: Res<Time<Fixed>>,
+    timing: (Res<Time<Fixed>>, ResMut<Performance>),
 ) {
+    let (time, mut performance) = timing;
+    let started = Instant::now();
     explosions.advance(time.delta_secs());
     if let Some(center) = gravity.take_detonation() {
         explosions.start_chain(center);
     }
     let blasts = explosions.take_ready();
+    performance.current.work.blasts += blasts.len() as u64;
     if !blasts.is_empty() {
         let mut entities: Vec<_> = asteroids.iter().map(|(entity, _, _)| entity).collect();
         entities.sort_by_key(|entity| entity.to_bits());
@@ -832,6 +902,7 @@ fn apply_detonation(
                 if asteroid.material.is_empty() {
                     continue;
                 }
+                performance.current.work.blast_pairs += 1;
                 let bound = GRID_SIZE as f32 * 0.5 * std::f32::consts::SQRT_2 * transform.scale.x;
                 if transform
                     .translation
@@ -849,13 +920,17 @@ fn apply_detonation(
                         .clamp_length_max(MAX_FRAGMENT_SPEED);
                 }
                 let cells_before = asteroid.material.cell_count();
+                performance.current.work.blast_cell_tests += u64::from(cells_before);
                 let removed = asteroid.material.remove_circle(
                     asteroid_local(transform, blast.center),
                     blast.radius() / transform.scale.x,
                 );
                 if removed > 0 {
-                    if asteroid.material.is_empty() && cells_before >= MIN_TRIGGER_CELLS {
-                        explosions.schedule_secondary(blast, position);
+                    if asteroid.material.is_empty()
+                        && cells_before >= MIN_TRIGGER_CELLS
+                        && explosions.schedule_secondary(blast, position)
+                    {
+                        performance.current.work.secondary_triggers += 1;
                     }
                     resolve_material_damage(
                         &mut commands,
@@ -869,6 +944,7 @@ fn apply_detonation(
         }
     }
     explosions.finish_tick();
+    performance.current.explosion_ms = started.elapsed().as_secs_f64() * 1000.0;
 }
 
 fn player_collisions(
@@ -955,6 +1031,72 @@ fn update_hud(
     if text.0 != value {
         text.0 = value;
     }
+}
+
+fn update_performance_overlay(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time<Real>>,
+    mut performance: ResMut<Performance>,
+    mut overlay: Query<(&mut Text, &mut Node), With<PerformanceOverlay>>,
+    entities: (Query<&Asteroid>, Query<(), With<Bullet>>),
+    explosions: Res<Explosions>,
+    mut state: Local<OverlayState>,
+) {
+    performance.record_frame(time.delta_secs_f64());
+    let toggled = keys.just_pressed(KeyCode::F3);
+    if toggled {
+        state.visible = !state.visible;
+    }
+    let Ok((mut text, mut node)) = overlay.single_mut() else {
+        return;
+    };
+    node.display = if state.visible {
+        Display::Flex
+    } else {
+        Display::None
+    };
+    if !state.visible {
+        return;
+    }
+    state.elapsed += time.delta_secs_f64();
+    if !toggled && state.elapsed < 0.25 {
+        return;
+    }
+    state.elapsed = 0.0;
+    let Some(frames) = performance.frame_summary() else {
+        return;
+    };
+    let Some(simulation) = performance.simulation_summary() else {
+        return;
+    };
+    let (bodies, bullets) = entities;
+    let fragments = bodies
+        .iter()
+        .filter(|body| body.fragment_lifetime.is_some())
+        .count();
+    let tick = performance.current;
+    text.0 = format!(
+        "PERF [F3] frame samples {}/240 | sim {}/240\nFrame wall ms: p50 {:6.2}  p95 {:6.2}  p99 {:6.2}\nSim span ms: last {:7.3}  p95 {:7.3}\nBullet pass {:7.3} ms  |  Blast pass {:7.3} ms\nBodies {} (fragments {})  bullets {}  queued {}\nLast tick: pairs {}  narrow {}  occupied-cell tests {}\nBlasts {}  triggers {}  new fragments {}",
+        frames.count,
+        simulation.count,
+        frames.p50,
+        frames.p95,
+        frames.p99,
+        tick.simulation_ms,
+        simulation.p95,
+        tick.collision_ms,
+        tick.explosion_ms,
+        bodies.iter().count(),
+        fragments,
+        bullets.iter().count(),
+        explosions.pending_count(),
+        tick.work.bullet_pairs,
+        tick.work.narrow_candidates,
+        tick.work.projectile_cell_tests,
+        tick.work.blasts,
+        tick.work.secondary_triggers,
+        tick.work.new_fragments,
+    );
 }
 
 #[cfg(test)]
@@ -1046,6 +1188,93 @@ mod tests {
                 GameEntity,
             ))
             .id()
+    }
+
+    #[test]
+    fn collision_counters_distinguish_broad_rejection_from_material_tests() {
+        let mut work = WorkCounts::default();
+        let mut material = MaterialGrid::from_rows([u32::MAX; GRID_SIZE]);
+        let far = Transform::from_xyz(1000.0, 0.0, 0.0).with_scale(Vec3::splat(ASTEROID_SCALE));
+        assert!(asteroid_hit(&far, &material, Vec2::ZERO, Vec2::X, &mut work).is_none());
+        assert_eq!(
+            (
+                work.bullet_pairs,
+                work.narrow_candidates,
+                work.projectile_cell_tests
+            ),
+            (1, 0, 0)
+        );
+        let pose = Transform::default().with_scale(Vec3::splat(ASTEROID_SCALE));
+        assert!(
+            asteroid_hit(
+                &pose,
+                &material,
+                -Vec2::X * 100.0,
+                Vec2::X * 100.0,
+                &mut work
+            )
+            .is_some()
+        );
+        assert_eq!(
+            (
+                work.bullet_pairs,
+                work.narrow_candidates,
+                work.projectile_cell_tests
+            ),
+            (2, 1, 1024)
+        );
+        material.remove_circle(Vec2::ZERO, CRATER_RADIUS);
+        assert!(asteroid_hit(&pose, &material, Vec2::ZERO, Vec2::ZERO, &mut work).is_none());
+        assert_eq!((work.bullet_pairs, work.narrow_candidates), (3, 2));
+        assert_eq!(
+            work.projectile_cell_tests,
+            1024 + u64::from(material.cell_count())
+        );
+    }
+
+    #[test]
+    fn f3_overlay_updates_and_toggles_while_simulation_is_paused() {
+        let mut app = game();
+        app.init_resource::<ButtonInput<KeyCode>>();
+        let overlay = app
+            .world_mut()
+            .spawn((PerformanceOverlay, Text::default(), Node::default()))
+            .id();
+        app.add_systems(Update, update_performance_overlay);
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F3);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(overlay).unwrap().display,
+            Display::Flex
+        );
+        assert!(
+            app.world()
+                .get::<Text>(overlay)
+                .unwrap()
+                .0
+                .contains("Frame wall ms")
+        );
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.release(KeyCode::F3);
+            keys.clear();
+        }
+        app.world_mut()
+            .resource_mut::<NextState<GameState>>()
+            .set(GameState::Paused);
+        let ticks = app.world().resource::<Performance>().completed_ticks;
+        app.update();
+        app.world_mut()
+            .resource_mut::<ButtonInput<KeyCode>>()
+            .press(KeyCode::F3);
+        app.update();
+        assert_eq!(
+            app.world().get::<Node>(overlay).unwrap().display,
+            Display::None
+        );
+        assert_eq!(app.world().resource::<Performance>().completed_ticks, ticks);
     }
 
     fn queue_detonation(app: &mut App, center: Vec2) {
@@ -1978,7 +2207,8 @@ mod tests {
                 &transform,
                 &material,
                 world(Vec2::new(-20.0, 15.5)),
-                world(Vec2::new(-12.0, 15.5))
+                world(Vec2::new(-12.0, 15.5)),
+                &mut WorkCounts::default()
             )
             .is_some()
         );
@@ -1987,7 +2217,8 @@ mod tests {
                 &transform,
                 &material,
                 world(Vec2::new(-20.0, -15.5)),
-                world(Vec2::new(-12.0, -15.5))
+                world(Vec2::new(-12.0, -15.5)),
+                &mut WorkCounts::default()
             )
             .is_none()
         );
